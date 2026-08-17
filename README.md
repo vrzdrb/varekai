@@ -1,3 +1,5 @@
+<img width="639" height="713" alt="preview" src="https://github.com/user-attachments/assets/4f2410b6-be9c-4589-80bc-3202ee5df183" />
+
 # Varekai
 
 Интерактивный bash-скрипт развёртывания и управления форком Xray от **Jolymmiles** с XHTTP-фоллбэком, предполагающий работу в качестве self-steal реверс-прокси
@@ -13,7 +15,7 @@
 - Ядро: [Jolymmiles/Xray-core](https://github.com/Jolymmiles/Xray-core) c встроенной поддержкой mihomo-совместимого мультиплексирования **SMUX** и **H2MUX**
 - Удобное обновление ядра с выбором конкретной версии для установки
 - Установка модуля ядра Linux TCP Brutal
-- Автоматическая установка WARP от [xxphantom/docker-warp-native](https://github.com/xxphantom/docker-warp-native). При установке Xray WARP устанавливается автоматически
+- Автоматическая установка WARP от [xxphantom/docker-warp-native](https://github.com/xxphantom/docker-warp-native). при установке Xray
 - Возможность обновления правил серверного роутинга из удалённого источника
 - Удобная работа с бэкапами конфига Xray
 - Пакетное добавление / удаление пользователей
@@ -24,6 +26,6 @@
 ## Установка
 
 ```bash
-curl -sL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/xray-management.sh -o xray-management.sh
-chmod +x xray-management.sh
-sudo ./xray-management.sh
+curl -sL https://raw.githubusercontent.com/vrzdrb/varekai/main/varekai.sh -o varekai.sh
+chmod +x varekai.sh
+sudo ./varekai.sh
