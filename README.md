@@ -28,5 +28,4 @@
 ```bash
 curl -sL https://raw.githubusercontent.com/vrzdrb/varekai/main/varekai.sh -o varekai.sh
 chmod +x varekai.sh
-sudo ./varekai<img width="639" height="713" alt="preview" src="https://github.com/user-attachments/assets/6806918f-d90f-4b06-bbdc-cf797c50e1bb" />
-.sh
+sudo ./varekai.sh
