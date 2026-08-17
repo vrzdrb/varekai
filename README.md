@@ -1,5 +1,7 @@
 # Varekai
 
+<img width="639" height="713" alt="preview" src="https://github.com/user-attachments/assets/4f2410b6-be9c-4589-80bc-3202ee5df183" />
+
 Интерактивный bash-скрипт развёртывания и управления форком Xray от **Jolymmiles** с XHTTP-фоллбэком, предполагающий работу в качестве self-steal реверс-прокси
 
 ### Требования
@@ -24,6 +26,7 @@
 ## Установка
 
 ```bash
-curl -sL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/xray-management.sh -o xray-management.sh
-chmod +x xray-management.sh
-sudo ./xray-management.sh
+curl -sL https://raw.githubusercontent.com/vrzdrb/varekai/main/varekai.sh -o varekai.sh
+chmod +x varekai.sh
+sudo ./varekai<img width="639" height="713" alt="preview" src="https://github.com/user-attachments/assets/6806918f-d90f-4b06-bbdc-cf797c50e1bb" />
+.sh
