@@ -1,6 +1,6 @@
-# Varekai
-
 <img width="639" height="713" alt="preview" src="https://github.com/user-attachments/assets/4f2410b6-be9c-4589-80bc-3202ee5df183" />
+
+# Varekai
 
 Интерактивный bash-скрипт развёртывания и управления форком Xray от **Jolymmiles** с XHTTP-фоллбэком, предполагающий работу в качестве self-steal реверс-прокси
 
