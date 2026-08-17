@@ -185,16 +185,76 @@ get_xray_version() {
 # --- Получение списка версий из GitHub ---
 get_available_versions() {
     local arch=$1
+    local cache_file="/tmp/xray-versions-cache.txt"
+    local cache_ttl=3600  # 1 час в секундах
+
+    # Проверка кэша
+    if [[ -f "$cache_file" ]]; then
+        local cache_age=$(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) ))
+        if [[ $cache_age -lt $cache_ttl ]]; then
+            # Проверка валидности кэша (каждая строка должна начинаться с 'v' или цифры)
+            if grep -qE '^v?[0-9]' "$cache_file" 2>/dev/null; then
+                cat "$cache_file"
+                return 0
+            fi
+        fi
+    fi
+
     local tmp_file=$(mktemp)
 
-    curl -s "https://api.github.com/repos/${XRAY_FORK_REPO}/releases" \
+    echo -e "${YELLOW}  → Запрос к GitHub API...${NC}" >&2
+
+    # Выполняем curl
+    local curl_exit_code=0
+    curl -s -f -L \
         -H "Accept: application/vnd.github.v3+json" \
-        > "$tmp_file"
+        -H "User-Agent: Xray-Management-Script" \
+        "https://api.github.com/repos/${XRAY_FORK_REPO}/releases" \
+        -o "$tmp_file" 2>/dev/null || curl_exit_code=$?
 
-    local versions=$(grep '"tag_name"' "$tmp_file" | cut -d'"' -f4 | head -n 10)
-    rm "$tmp_file"
+    if [[ $curl_exit_code -ne 0 ]]; then
+        echo -e "${RED}  ✗ Ошибка curl (код: $curl_exit_code)${NC}" >&2
+        rm -f "$tmp_file"
+        return 1
+    fi
 
-    echo "$versions"
+    # Проверка, что файл не пустой
+    if [[ ! -s "$tmp_file" ]]; then
+        echo -e "${RED}  ✗ Ответ от GitHub пустой${NC}" >&2
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # Проверка валидности JSON
+    if ! jq empty "$tmp_file" 2>/dev/null; then
+        echo -e "${RED}  ✗ GitHub вернул невалидный JSON${NC}" >&2
+        # Проверяем на rate limit
+        if grep -q "API rate limit" "$tmp_file" 2>/dev/null; then
+            echo -e "${YELLOW}  ⚠ Превышен лимит запросов к GitHub API${NC}" >&2
+        fi
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    # Извлечение версий через jq
+    local all_versions
+    all_versions=$(jq -r '.[].tag_name // empty' "$tmp_file" 2>/dev/null)
+    rm -f "$tmp_file"
+
+    if [[ -z "$all_versions" ]]; then
+        echo -e "${RED}  ✗ В ответе не найдено ни одного релиза${NC}" >&2
+        return 1
+    fi
+
+    local version_count
+    version_count=$(echo "$all_versions" | wc -l)
+    echo -e "${GREEN}  ✓ Получено версий: $version_count${NC}" >&2
+
+    # Сохранение в кэш
+    echo "$all_versions" > "$cache_file"
+
+    # В stdout только чистый список версий
+    echo "$all_versions"
 }
 
 # --- Установка Xray ---
@@ -291,35 +351,96 @@ update_xray() {
 
     local current_version=$(get_xray_version)
     echo -e "${CYAN}Текущая версия: ${GREEN}${current_version}${NC}"
+    echo -e "${CYAN}Архитектура: ${GREEN}${MACHINE}${NC}"
+    echo -e "${CYAN}Репозиторий: ${GREEN}https://github.com/${XRAY_FORK_REPO}${NC}"
+    echo
 
     echo -e "${YELLOW}Получение списка доступных версий...${NC}"
-    local versions=$(get_available_versions "$MACHINE")
 
+    # Сохраняем stdout отдельно от stderr (сообщения диагностики)
+    local versions_file=$(mktemp)
+    if ! get_available_versions "$MACHINE" > "$versions_file"; then
+        echo
+        echo -e "${RED}═══════════════════════════════════════${NC}"
+        echo -e "${RED}Не удалось получить список версий${NC}"
+        echo -e "${RED}═══════════════════════════════════════${NC}"
+        rm -f "$versions_file"
+
+        echo
+        echo -e "${YELLOW}Альтернативный вариант — ввести версию вручную.${NC}"
+        echo -e "${YELLOW}Список версий можно посмотреть здесь:${NC}"
+        echo -e "${CYAN}https://github.com/${XRAY_FORK_REPO}/releases${NC}"
+        echo
+        read -p "Введите название версии (например, v26.8.15) или Enter для отмены: " manual_version
+
+        if [[ -z "$manual_version" ]]; then
+            echo -e "${RED}Обновление отменено${NC}"
+            return 1
+        fi
+
+        echo "$manual_version" > "$versions_file"
+        echo -e "${YELLOW}Будет использована версия: $manual_version${NC}"
+    fi
+
+    local versions=$(cat "$versions_file")
+    rm -f "$versions_file"
+
+    if [[ -z "$versions" ]]; then
+        echo -e "${RED}Список версий пуст. Обновление отменено.${NC}"
+        return 1
+    fi
+
+    echo
     echo -e "${CYAN}Доступные версии:${NC}"
     local i=1
     local version_array=()
     while IFS= read -r version; do
         if [[ -n "$version" ]]; then
-            echo -e "${CYAN}$i. $version${NC}"
+            # Подсветка текущей версии
+            if [[ "$version" == "$current_version" || "v${version#v}" == "$current_version" ]]; then
+                echo -e "${CYAN}$i. $version ${GREEN}← текущая${NC}"
+            else
+                echo -e "${CYAN}$i. $version${NC}"
+            fi
             version_array+=("$version")
             ((i++))
         fi
     done <<< "$versions"
-    echo -e "${CYAN}0. latest (последняя стабильная)${NC}"
 
-    read -p "Выберите версию для обновления (0-$((i-1))) [0]: " version_choice
+    echo -e "${CYAN}0. latest (последняя стабильная)${NC}"
+    echo
+    echo -e "${YELLOW}Введите номер версии (0-$((i-1))) или название версии вручную:${NC}"
+    read -p "Выбор [0]: " version_choice
     version_choice=${version_choice:-0}
 
     local update_version=""
-    if [[ "$version_choice" == "0" ]]; then
-        update_version="latest"
-        echo -e "${YELLOW}Обновление до последней версии...${NC}"
-    elif [[ "$version_choice" =~ ^[0-9]+$ && "$version_choice" -gt 0 && "$version_choice" -lt "$i" ]]; then
-        update_version="${version_array[$((version_choice-1))]}"
-        echo -e "${YELLOW}Обновление до версии $update_version...${NC}"
+
+    # Проверка, является ли ввод числом (выбор по номеру)
+    if [[ "$version_choice" =~ ^[0-9]+$ ]]; then
+        if [[ "$version_choice" == "0" ]]; then
+            update_version="latest"
+            echo -e "${YELLOW}Обновление до последней версии...${NC}"
+        elif [[ "$version_choice" -gt 0 && "$version_choice" -lt "$i" ]]; then
+            update_version="${version_array[$((version_choice-1))]}"
+            echo -e "${YELLOW}Обновление до версии $update_version...${NC}"
+        else
+            echo -e "${RED}Неверный номер. Обновление отменено.${NC}"
+            return 1
+        fi
     else
-        echo -e "${RED}Неверный выбор. Обновление отменено.${NC}"
-        return 1
+        # Пользователь ввёл название версии вручную
+        update_version="$version_choice"
+        echo -e "${YELLOW}Обновление до указанной версии $update_version...${NC}"
+
+        # Проверка, существует ли такая версия в списке
+        if ! echo "$versions" | grep -qx "$update_version"; then
+            echo -e "${YELLOW}Внимание: версия $update_version не найдена в списке релизов${NC}"
+            read -p "Продолжить всё равно? [y/N]: " confirm
+            if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                echo -e "${RED}Обновление отменено${NC}"
+                return 1
+            fi
+        fi
     fi
 
     # Создание бэкапа текущего бинарника
@@ -340,7 +461,7 @@ update_xray() {
     local tmp_dir=$(mktemp -d)
     local zip_file="${tmp_dir}/xray.zip"
 
-    echo -e "${YELLOW}Скачивание Xray...${NC}"
+    echo -e "${YELLOW}Скачивание Xray из ${download_url}...${NC}"
     if ! curl -L -o "$zip_file" "$download_url"; then
         echo -e "${RED}Ошибка скачивания Xray${NC}"
         rm -rf "$tmp_dir"
@@ -348,12 +469,33 @@ update_xray() {
         return 1
     fi
 
+    # Проверка, что файл скачался и не пустой
+    if [[ ! -s "$zip_file" ]]; then
+        echo -e "${RED}Скачанный файл пуст. Возможно, версия не существует или архив отсутствует для вашей архитектуры.${NC}"
+        rm -rf "$tmp_dir"
+        rm -f "$backup_bin"
+        return 1
+    fi
+
+    local file_size=$(du -h "$zip_file" | cut -f1)
+    echo -e "${GREEN}✓ Скачан архив размером $file_size${NC}"
+
     # Распаковка
     echo -e "${YELLOW}Распаковка...${NC}"
     if ! unzip -q "$zip_file" -d "$tmp_dir"; then
         echo -e "${RED}Ошибка распаковки${NC}"
         rm -rf "$tmp_dir"
-        # Восстановление из бэкапа
+        mv "$backup_bin" "$XRAY_BIN"
+        echo -e "${YELLOW}Восстановлен бинарник из бэкапа${NC}"
+        return 1
+    fi
+
+    # Проверка наличия бинарника в архиве
+    if [[ ! -f "${tmp_dir}/xray" ]]; then
+        echo -e "${RED}Бинарник xray не найден в архиве${NC}"
+        echo -e "${YELLOW}Содержимое архива:${NC}"
+        ls -la "$tmp_dir"
+        rm -rf "$tmp_dir"
         mv "$backup_bin" "$XRAY_BIN"
         echo -e "${YELLOW}Восстановлен бинарник из бэкапа${NC}"
         return 1
