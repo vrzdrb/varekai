@@ -84,6 +84,7 @@ save_env_config() {
 ROUTING_URL="${ROUTING_URL:-}"
 DOMAIN="${DOMAIN:-}"
 EDITOR="${EDITOR:-}"
+EDITOR_CONFIGURED="${EDITOR_CONFIGURED:-false}"
 EOF
     chmod 644 "$ENV_CONFIG_PATH"
 }
@@ -1437,8 +1438,23 @@ open_config() {
         return 1
     fi
 
-    # Проверка сохранённого редактора
-    if [[ -z "$EDITOR" ]]; then
+    # Проверяем существование xray-env.conf
+    if [[ ! -f "$ENV_CONFIG_PATH" ]]; then
+        echo -e "${YELLOW}Файл конфигурации скрипта не найден. Создаём ${ENV_CONFIG_PATH}...${NC}"
+        cat > "$ENV_CONFIG_PATH" << EOF
+# Xray Environment Configuration
+ROUTING_URL=""
+DOMAIN=""
+EDITOR=""
+EDITOR_CONFIGURED="false"
+EOF
+        chmod 644 "$ENV_CONFIG_PATH"
+        echo -e "${GREEN}✓ Файл создан${NC}"
+        echo
+    fi
+
+    # КЛЮЧЕВАЯ ПРОВЕРКА: был ли редактор выбран через наше меню?
+    if [[ "$EDITOR_CONFIGURED" != "true" ]]; then
         echo -e "${YELLOW}Текстовый редактор не настроен. Выберите редактор:${NC}"
         echo -e "${CYAN}1. nano${NC}"
         echo -e "${CYAN}2. micro${NC}"
@@ -1460,28 +1476,30 @@ open_config() {
                 ;;
         esac
 
+        # Помечаем, что редактор выбран через меню
+        EDITOR_CONFIGURED="true"
         save_env_config
 
-        echo -e "${GREEN}✓ Редактор '$EDITOR' сохранён.${NC}"
-        echo -e "${YELLOW}Если захотите изменить редактор, отредактируйте файл:${NC}"
+        echo -e "${GREEN}✓ Редактор '${EDITOR}' сохранён.${NC}"
+        echo -e "${YELLOW}Чтобы изменить редактор, отредактируйте файл:${NC}"
         echo -e "${CYAN}$ENV_CONFIG_PATH${NC}"
-        echo -e "${YELLOW}и измените значение переменной EDITOR${NC}"
+        echo -e "${YELLOW}изменив переменную EDITOR и оставив EDITOR_CONFIGURED=\"true\"${NC}"
         echo
         read -p "Нажмите Enter для продолжения..."
     fi
 
     # Проверка установки редактора
     if ! command -v "$EDITOR" &> /dev/null; then
-        echo -e "${YELLOW}Редактор $EDITOR не установлен. Устанавливаем...${NC}"
-        apt-get install -y "$EDITOR" > /dev/null 2>&1
-
-        if [[ $? -ne 0 ]]; then
-            echo -e "${RED}Не удалось установить $EDITOR${NC}"
+        echo -e "${YELLOW}Редактор '$EDITOR' не установлен. Устанавливаем...${NC}"
+        if ! apt-get install -y "$EDITOR" > /dev/null 2>&1; then
+            echo -e "${RED}Не удалось установить '$EDITOR'${NC}"
+            echo -e "${YELLOW}Отредактируйте ${ENV_CONFIG_PATH} вручную${NC}"
             return 1
         fi
+        echo -e "${GREEN}✓ Редактор '$EDITOR' установлен${NC}"
     fi
 
-    echo -e "${CYAN}Открытие конфига в $EDITOR...${NC}"
+    echo -e "${CYAN}Открытие конфига в ${EDITOR}...${NC}"
     "$EDITOR" "$CONFIG_PATH"
 }
 
@@ -2280,4 +2298,5 @@ main() {
 
 # Запуск
 main "$@"
+
 
