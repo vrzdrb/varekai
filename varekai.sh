@@ -598,14 +598,11 @@ generate_config() {
     local public_key=$(echo "$x25519_keys" | awk '{print $2}')
 
     local vision_uuid=$(generate_uuid)
-    local xhttp_uuid=$(generate_uuid)
 
     local short_ids=$(generate_short_ids)
     local short_id_1=$(echo "$short_ids" | awk '{print $1}')
     local short_id_2=$(echo "$short_ids" | awk '{print $2}')
     local short_id_3=$(echo "$short_ids" | awk '{print $3}')
-
-    local xhttp_path=$(generate_path)
 
     cat > "$CONFIG_PATH" << EOF
 {
@@ -891,13 +888,7 @@ generate_config() {
             "level": 0
           }
         ],
-        "decryption": "none",
-        "fallbacks": [
-          {
-            "dest": "@uds2xhttp.sock",
-            "xver": 1
-          }
-        ]
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "tcp",
@@ -915,40 +906,6 @@ generate_config() {
             "$short_id_2",
             "$short_id_3"
           ]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ]
-      }
-    },
-    {
-      "tag": "VLESS-XHTTP-REALITY",
-      "listen": "@uds2xhttp.sock",
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "email": "vless@xhttp.reality",
-            "id": "$xhttp_uuid",
-            "level": 0
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "xhttp",
-        "xhttpSettings": {
-          "host": "",
-          "path": "$xhttp_path",
-          "mode": "auto"
-        },
-        "sockopt": {
-          "acceptProxyProtocol": true
         }
       },
       "sniffing": {
@@ -1563,15 +1520,8 @@ batch_add_users() {
         return 1
     fi
 
-    echo -e "${YELLOW}В какие inbound'ы добавлять пользователей?${NC}"
-    echo -e "${CYAN}1. Только VLESS-Vision-REALITY${NC}"
-    echo -e "${CYAN}2. Только VLESS-XHTTP-REALITY${NC}"
-    echo -e "${CYAN}3. Оба inbound'а${NC}"
-
-    read -p "Выбор [1-3]: " inbound_choice
-
-    if [[ ! "$inbound_choice" =~ ^[1-3]$ ]]; then
-        echo -e "${RED}Неверный выбор${NC}"
+    if ! jq -e '.inbounds[] | select(.tag == "VLESS-Vision-REALITY")' "$CONFIG_PATH" >/dev/null 2>&1; then
+        echo -e "${RED}Inbound VLESS-Vision-REALITY не найден в config.json${NC}"
         return 1
     fi
 
@@ -1593,6 +1543,7 @@ batch_add_users() {
     if [[ ${#users[@]} -ne $count ]]; then
         echo -e "${YELLOW}Внимание: указано $count, но введено ${#users[@]} email'ов${NC}"
         read -p "Продолжить с ${#users[@]} пользователями? [y/N]: " confirm
+
         if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
             echo -e "${RED}Операция отменена${NC}"
             return 1
@@ -1605,61 +1556,35 @@ batch_add_users() {
         local uuid=$(generate_uuid)
         local tmp_config=$(mktemp)
 
-        case "$inbound_choice" in
-            1)
-                # Только Vision
-                if jq --arg email "$email" --arg uuid "$uuid" \
-                    '.inbounds |= map(if .tag == "VLESS-Vision-REALITY" then .settings.clients += [{"email": $email, "id": $uuid, "flow": "", "level": 0}] else . end)' \
-                    "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
-                    mv "$tmp_config" "$CONFIG_PATH"
-                    echo "$email:$uuid:$(date '+%Y-%m-%d %H:%M:%S')" >> "$USERS_LIST"
-                    echo -e "${GREEN}✓ Добавлен: $email (UUID: $uuid)${NC}"
-                    ((added_count++))
+        if jq --arg email "$email" --arg uuid "$uuid" '
+            .inbounds |= map(
+                if .tag == "VLESS-Vision-REALITY" then
+                    .settings = (.settings // {}) |
+                    .settings.clients = ((.settings.clients // []) + [{
+                        "email": $email,
+                        "id": $uuid,
+                        "flow": "",
+                        "level": 0
+                    }])
                 else
-                    rm -f "$tmp_config"
-                    echo -e "${RED}✗ Ошибка добавления: $email${NC}"
-                fi
-                ;;
-            2)
-                # Только XHTTP
-                if jq --arg email "$email" --arg uuid "$uuid" \
-                    '.inbounds |= map(if .tag == "VLESS-XHTTP-REALITY" then .settings.clients += [{"email": $email, "id": $uuid, "level": 0}] else . end)' \
-                    "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
-                    mv "$tmp_config" "$CONFIG_PATH"
-                    echo "$email:$uuid:$(date '+%Y-%m-%d %H:%M:%S')" >> "$USERS_LIST"
-                    echo -e "${GREEN}✓ Добавлен: $email (UUID: $uuid)${NC}"
-                    ((added_count++))
-                else
-                    rm -f "$tmp_config"
-                    echo -e "${RED}✗ Ошибка добавления: $email${NC}"
-                fi
-                ;;
-            3)
-                # Оба inbound'а
-                if jq --arg email "$email" --arg uuid "$uuid" \
-                    '.inbounds |= map(
-                        if .tag == "VLESS-Vision-REALITY" then
-                            .settings.clients += [{"email": $email, "id": $uuid, "flow": "", "level": 0}]
-                        elif .tag == "VLESS-XHTTP-REALITY" then
-                            .settings.clients += [{"email": $email, "id": $uuid, "level": 0}]
-                        else .
-                        end
-                    )' \
-                    "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
-                    mv "$tmp_config" "$CONFIG_PATH"
-                    echo "$email:$uuid:$(date '+%Y-%m-%d %H:%M:%S')" >> "$USERS_LIST"
-                    echo -e "${GREEN}✓ Добавлен: $email (UUID: $uuid)${NC}"
-                    ((added_count++))
-                else
-                    rm -f "$tmp_config"
-                    echo -e "${RED}✗ Ошибка добавления: $email${NC}"
-                fi
-                ;;
-        esac
+                    .
+                end
+            )' "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
+            mv "$tmp_config" "$CONFIG_PATH"
+
+            echo "$email:$uuid:$(date '+%Y-%m-%d %H:%M:%S')" >> "$USERS_LIST"
+            echo -e "${GREEN}✓ Добавлен: $email (UUID: $uuid)${NC}"
+
+            ((added_count++))
+        else
+            rm -f "$tmp_config"
+            echo -e "${RED}✗ Ошибка добавления: $email${NC}"
+        fi
     done
 
     if [[ $added_count -gt 0 ]]; then
         systemctl restart xray
+
         echo -e "${GREEN}✓ Успешно добавлено $added_count из ${#users[@]} пользователей${NC}"
         log_message "Добавлено $added_count пользователей"
     else
@@ -1676,6 +1601,11 @@ batch_remove_users() {
         return 1
     fi
 
+    if ! jq -e '.inbounds[] | select(.tag == "VLESS-Vision-REALITY")' "$CONFIG_PATH" >/dev/null 2>&1; then
+        echo -e "${RED}Inbound VLESS-Vision-REALITY не найден в config.json${NC}"
+        return 1
+    fi
+
     echo -e "${YELLOW}Введите email'ы или UUID'ы для удаления (через пробел):${NC}"
     read -p "Значения: " -a search_values
 
@@ -1686,42 +1616,80 @@ batch_remove_users() {
 
     local found_count=0
     local not_found=()
-
     local tmp_config=$(mktemp)
+
     cp "$CONFIG_PATH" "$tmp_config"
 
     for value in "${search_values[@]}"; do
+        local found=false
+
         if [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            if jq --arg uuid "$value" \
-                '(.inbounds[].settings.clients) |= map(select(.id != $uuid))' \
-                "$tmp_config" > "${tmp_config}.tmp" 2>&1; then
-                mv "${tmp_config}.tmp" "$tmp_config"
-                ((found_count++))
-                echo -e "${GREEN}✓ Удалён по UUID: $value${NC}"
-            else
-                not_found+=("$value")
+            if jq -e --arg uuid "$value" '
+                [
+                    .inbounds[]
+                    | select(.tag == "VLESS-Vision-REALITY")
+                    | .settings.clients? // []
+                    | .[]
+                    | select(.id == $uuid)
+                ] | length > 0
+            ' "$tmp_config" >/dev/null 2>&1; then
+                if jq --arg uuid "$value" '
+                    .inbounds |= map(
+                        if .tag == "VLESS-Vision-REALITY" and ((.settings.clients | type) == "array") then
+                            .settings.clients |= map(select((.id // "") != $uuid))
+                        else
+                            .
+                        end
+                    )
+                ' "$tmp_config" > "${tmp_config}.tmp" 2>/dev/null; then
+                    mv "${tmp_config}.tmp" "$tmp_config"
+                    found=true
+                fi
             fi
         else
-            if jq --arg email "$value" \
-                '(.inbounds[].settings.clients) |= map(select(.email != $email))' \
-                "$tmp_config" > "${tmp_config}.tmp" 2>&1; then
-                mv "${tmp_config}.tmp" "$tmp_config"
-                ((found_count++))
-                echo -e "${GREEN}✓ Удалён по email: $value${NC}"
-            else
-                not_found+=("$value")
+            if jq -e --arg email "$value" '
+                [
+                    .inbounds[]
+                    | select(.tag == "VLESS-Vision-REALITY")
+                    | .settings.clients? // []
+                    | .[]
+                    | select(.email == $email)
+                ] | length > 0
+            ' "$tmp_config" >/dev/null 2>&1; then
+                if jq --arg email "$value" '
+                    .inbounds |= map(
+                        if .tag == "VLESS-Vision-REALITY" and ((.settings.clients | type) == "array") then
+                            .settings.clients |= map(select((.email // "") != $email))
+                        else
+                            .
+                        end
+                    )
+                ' "$tmp_config" > "${tmp_config}.tmp" 2>/dev/null; then
+                    mv "${tmp_config}.tmp" "$tmp_config"
+                    found=true
+                fi
             fi
+        fi
+
+        if [[ "$found" == "true" ]]; then
+            ((found_count++))
+            echo -e "${GREEN}✓ Удалён: $value${NC}"
+        else
+            not_found+=("$value")
         fi
     done
 
     if [[ $found_count -gt 0 ]]; then
         mv "$tmp_config" "$CONFIG_PATH"
         systemctl restart xray
+
         echo -e "${GREEN}✓ Удалено $found_count пользователей${NC}"
         log_message "Удалено $found_count пользователей"
     else
-        rm "$tmp_config"
+        rm -f "$tmp_config"
     fi
+
+    rm -f "${tmp_config}.tmp"
 
     if [[ ${#not_found[@]} -gt 0 ]]; then
         echo -e "${RED}Не найдены:${NC}"
@@ -2150,6 +2118,11 @@ generate_vless_links() {
         return 1
     fi
 
+    if ! jq -e '.inbounds[] | select(.tag == "VLESS-Vision-REALITY")' "$CONFIG_PATH" >/dev/null 2>&1; then
+        echo -e "${RED}Inbound VLESS-Vision-REALITY не найден в config.json${NC}"
+        return 1
+    fi
+
     echo -e "${YELLOW}Получение IP сервера...${NC}"
     local server_ip=$(curl -s ifconfig.me)
 
@@ -2160,11 +2133,35 @@ generate_vless_links() {
 
     echo -e "${GREEN}IP сервера: $server_ip${NC}"
 
-    local domain=$(jq -r '.inbounds[] | select(.tag == "VLESS-Vision-REALITY") | .streamSettings.realitySettings.serverNames[0]' "$CONFIG_PATH")
-    local private_key=$(jq -r '.inbounds[] | select(.tag == "VLESS-Vision-REALITY") | .streamSettings.realitySettings.privateKey' "$CONFIG_PATH")
-    local public_key=$(xray x25519 -i "$private_key" | sed -ne '2s/.*:\s*//p')
-    local short_ids=$(jq -r '.inbounds[] | select(.tag == "VLESS-Vision-REALITY") | .streamSettings.realitySettings.shortIds[0]' "$CONFIG_PATH")
-    local xhttp_path=$(jq -r '.inbounds[] | select(.tag == "VLESS-XHTTP-REALITY") | .streamSettings.xhttpSettings.path' "$CONFIG_PATH")
+    local domain=$(jq -r '
+        .inbounds[]
+        | select(.tag == "VLESS-Vision-REALITY")
+        | .streamSettings.realitySettings.serverNames[0] // empty
+    ' "$CONFIG_PATH")
+
+    local private_key=$(jq -r '
+        .inbounds[]
+        | select(.tag == "VLESS-Vision-REALITY")
+        | .streamSettings.realitySettings.privateKey // empty
+    ' "$CONFIG_PATH")
+
+    local short_id=$(jq -r '
+        .inbounds[]
+        | select(.tag == "VLESS-Vision-REALITY")
+        | .streamSettings.realitySettings.shortIds[0] // empty
+    ' "$CONFIG_PATH")
+
+    if [[ -z "$domain" || -z "$private_key" || -z "$short_id" ]]; then
+        echo -e "${RED}Не найдены параметры VLESS-Vision-REALITY в config.json${NC}"
+        return 1
+    fi
+
+    local public_key=$($XRAY_BIN x25519 -i "$private_key" 2>/dev/null | awk -F': ' 'NR==2 {print $2}')
+
+    if [[ -z "$public_key" ]]; then
+        echo -e "${RED}Не удалось получить public key из private key${NC}"
+        return 1
+    fi
 
     echo -e "${YELLOW}Выберите fingerprint:${NC}"
     echo -e "${CYAN}1. chrome${NC}"
@@ -2176,6 +2173,7 @@ generate_vless_links() {
     read -p "Выбор [1-5]: " fp_choice
 
     local fp=""
+
     case "$fp_choice" in
         1) fp="chrome" ;;
         2) fp="firefox" ;;
@@ -2197,26 +2195,38 @@ generate_vless_links() {
     fi
 
     for email in "${emails[@]}"; do
-        # Исправленный запрос с проверкой на существование .settings.clients
-        local uuid=$(jq -r --arg email "$email" \
-            '.inbounds[] | select(.settings.clients != null) | .settings.clients[] | select(.email == $email) | .id' \
-            "$CONFIG_PATH" | head -n 1)
+        local client_json=$(jq -c --arg email "$email" '
+            .inbounds[]
+            | select(.tag == "VLESS-Vision-REALITY")
+            | .settings.clients? // []
+            | .[]
+            | select(.email == $email)
+        ' "$CONFIG_PATH" | head -n 1)
 
-        if [[ -z "$uuid" ]]; then
+        if [[ -z "$client_json" ]]; then
             echo -e "${RED}Пользователь $email не найден${NC}"
             continue
         fi
 
-        echo -e "${CYAN}Ссылки для $email:${NC}"
+        local uuid=$(echo "$client_json" | jq -r '.id // empty')
+        local flow=$(echo "$client_json" | jq -r '.flow // empty')
 
-        local vision_link="vless://${uuid}@${server_ip}:443?type=tcp&security=reality&sni=${domain}&fp=${fp}&pbk=${public_key}&sid=${short_ids}&flow=#${email}"
+        if [[ -z "$uuid" ]]; then
+            echo -e "${RED}Не удалось получить UUID для $email${NC}"
+            continue
+        fi
+
+        local link="vless://${uuid}@${server_ip}:443?type=tcp&security=reality&sni=${domain}&fp=${fp}&pbk=${public_key}&sid=${short_id}"
+
+        if [[ -n "$flow" ]]; then
+            link+="&flow=${flow}"
+        fi
+
+        link+="#${email}"
+
+        echo -e "${CYAN}Ссылка для $email:${NC}"
         echo -e "${GREEN}VLESS-TCP-Reality:${NC}"
-        echo "$vision_link"
-
-        local xhttp_link="vless://${uuid}@${server_ip}:443?type=xhttp&security=reality&sni=${domain}&fp=${fp}&pbk=${public_key}&sid=${short_ids}&path=${xhttp_path}&mode=auto&flow=#${email}"
-        echo -e "${GREEN}VLESS-XHTTP-Reality:${NC}"
-        echo "$xhttp_link"
-
+        echo "$link"
         echo
     done
 }
