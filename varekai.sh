@@ -1303,17 +1303,14 @@ setup_tcp_brutal() {
 # --- Быстрый перезапуск Xray с выводом статуса ---
 restart_xray_status() {
     echo -e "${CYAN}=== Перезапуск Xray ===${NC}"
-
     if [[ ! -f /etc/systemd/system/xray.service ]]; then
         echo -e "${RED}Сервис Xray не установлен. Сначала установите Xray.${NC}"
         return 1
     fi
-
     echo -e "${YELLOW}Перезапуск Xray...${NC}"
     if systemctl restart xray; then
-        echo -e "${GREEN}✓ Xray перезапущен. Ожидание 5 секунд...${NC}"
-        sleep 5
-
+        echo -e "${GREEN}✓ Xray перезапущен. Ожидание 3 секунд...${NC}"
+        sleep 3
         echo
         echo -e "${CYAN}=== Статус Xray ===${NC}"
         systemctl status xray --no-pager
@@ -1328,46 +1325,55 @@ restart_xray_status() {
 # --- Обновление routing ---
 update_routing() {
     echo -e "${CYAN}=== Обновление routing ===${NC}"
-
     if [[ -z "$ROUTING_URL" ]]; then
         echo -e "${YELLOW}URL для routing не настроен. Используйте пункт меню 'Смена источника обновлений routing'${NC}"
         return 1
     fi
-
     echo -e "${YELLOW}Скачивание routing.json...${NC}"
     local tmp_file=$(mktemp)
-
     if ! curl -sL "$ROUTING_URL" -o "$tmp_file"; then
         echo -e "${RED}Ошибка скачивания routing${NC}"
-        rm "$tmp_file"
+        rm -f "$tmp_file"
         return 1
     fi
 
-    if ! jq . "$tmp_file" > /dev/null 2>&1; then
-        echo -e "${RED}Невалидный JSON${NC}"
-        rm "$tmp_file"
+    # Проверка валидности JSON (jq empty - самый надёжный способ)
+    if ! jq empty "$tmp_file" 2>/dev/null; then
+        echo -e "${RED}Скачанный файл не является валидным JSON${NC}"
+        rm -f "$tmp_file"
         return 1
     fi
 
     local routing_obj=""
+    # Проверяем, скачали мы целый конфиг с полем .routing или просто сам объект routing
     if jq -e '.routing' "$tmp_file" > /dev/null 2>&1; then
         routing_obj=$(jq '.routing' "$tmp_file")
     else
         routing_obj=$(jq '.' "$tmp_file")
     fi
 
-    local tmp_config=$(mktemp)
-    if jq --argjson routing "$routing_obj" '.routing = $routing' "$CONFIG_PATH" > "$tmp_config" 2>&1; then
-        mv "$tmp_config" "$CONFIG_PATH"
-        systemctl restart xray
-        echo -e "${GREEN}✓ Routing успешно обновлён!${NC}"
-        log_message "Routing обновлён"
+    # Автоматический бэкап перед изменением (для спокойствия)
+    local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    local backup_file="${BACKUP_DIR}/${timestamp}-config-before-routing.json.bak"
+    if cp "$CONFIG_PATH" "$backup_file"; then
+        echo -e "${GREEN}✓ Создан автоматический бэкап: $backup_file${NC}"
     else
-        echo -e "${RED}Ошибка обновления конфига${NC}"
-        rm "$tmp_config"
+        echo -e "${YELLOW}⚠ Не удалось создать бэкап, но продолжаем...${NC}"
     fi
 
-    rm "$tmp_file"
+    local tmp_config=$(mktemp)
+    # Применяем изменения. Важно: 2>/dev/null, чтобы случайные warnings не попали в JSON
+    if jq --argjson routing "$routing_obj" '.routing = $routing' "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
+        mv "$tmp_config" "$CONFIG_PATH"
+        chmod 644 "$CONFIG_PATH" # Возвращаем правильные права доступа после mv
+        systemctl restart xray
+        echo -e "${GREEN}✓ Routing успешно обновлён!${NC}"
+        log_message "Routing обновлён из $ROUTING_URL"
+    else
+        echo -e "${RED}Ошибка обновления конфига (jq не смог применить изменения)${NC}"
+        rm -f "$tmp_config"
+    fi
+    rm -f "$tmp_file"
 }
 
 # --- Смена источника routing ---
@@ -1514,188 +1520,378 @@ restore_backup() {
 # --- Пакетное добавление пользователей ---
 batch_add_users() {
     echo -e "${CYAN}=== Пакетное добавление пользователей ===${NC}"
-
     if [[ ! -f "$CONFIG_PATH" ]]; then
         echo -e "${RED}Конфиг не найден${NC}"
         return 1
     fi
 
-    if ! jq -e '.inbounds[] | select(.tag == "VLESS-Vision-REALITY")' "$CONFIG_PATH" >/dev/null 2>&1; then
-        echo -e "${RED}Inbound VLESS-Vision-REALITY не найден в config.json${NC}"
+    # Ищем все VLESS-инбаунды
+    local vless_inbounds_json
+    vless_inbounds_json=$(jq -c '.inbounds[] | select(.protocol == "vless")' "$CONFIG_PATH" 2>/dev/null)
+
+    if [[ -z "$vless_inbounds_json" ]]; then
+        echo -e "${YELLOW}VLESS-inbounds не найдены${NC}"
+        return 0
+    fi
+
+    local inbounds=()
+    local tags=()
+    local has_untagged=false
+
+    while IFS= read -r inb; do
+        local tag=$(echo "$inb" | jq -r '.tag // empty')
+        if [[ -z "$tag" ]]; then
+            has_untagged=true
+            continue
+        fi
+        inbounds+=("$inb")
+        tags+=("$tag")
+    done <<< "$vless_inbounds_json"
+
+    if [[ "$has_untagged" == "true" ]]; then
+        echo -e "${YELLOW}⚠ Найден VLESS-inbound без tag, он пропущен${NC}"
+    fi
+
+    if [[ ${#tags[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Нет доступных VLESS-inbounds с тегами${NC}"
+        return 0
+    fi
+
+    echo -e "${CYAN}Доступные VLESS-inbounds:${NC}"
+    for i in "${!tags[@]}"; do
+        echo -e "${CYAN}$((i+1)). ${tags[$i]}${NC}"
+    done
+    echo -e "${CYAN}0. Выход в главное меню${NC}"
+
+    local choice
+    while true; do
+        read -p "Выберите inbound [1-${#tags[@]}] или 0 для выхода: " choice
+        if [[ "$choice" == "0" ]]; then
+            echo -e "${YELLOW}Операция отменена${NC}"
+            return 0
+        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#tags[@]}" ]]; then
+            break
+        else
+            echo -e "${RED}Неверный ввод, повторите попытку${NC}"
+        fi
+    done
+
+    local selected_idx=$((choice-1))
+    local selected_tag="${tags[$selected_idx]}"
+    local selected_inb="${inbounds[$selected_idx]}"
+
+    # Проверка settings и clients
+    local has_settings=$(echo "$selected_inb" | jq 'has("settings")')
+    if [[ "$has_settings" != "true" ]]; then
+        echo -e "${RED}Ошибка: в выбранном inbound отсутствует блок settings${NC}"
         return 1
     fi
 
-    read -p "Количество пользователей (макс. 128): " count
-
-    if [[ ! "$count" =~ ^[0-9]+$ || "$count" -lt 1 || "$count" -gt 128 ]]; then
-        echo -e "${RED}Неверное количество${NC}"
+    local clients_type=$(echo "$selected_inb" | jq -r '.settings.clients | type // "null"')
+    if [[ "$clients_type" == "null" ]]; then
+        read -p "В выбранном inbound нет массива clients. Создать его? [Y/n]: " create_clients
+        create_clients=${create_clients:-y}
+        if [[ ! "$create_clients" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Операция отменена${NC}"
+            return 0
+        fi
+    elif [[ "$clients_type" != "array" ]]; then
+        echo -e "${RED}Ошибка: settings.clients не является массивом${NC}"
         return 1
     fi
 
-    echo -e "${YELLOW}Введите $count email'ов через пробел:${NC}"
-    read -p "Email'ы: " -a users
+    echo -e "${YELLOW}Введите email'ы через пробел (0 для выхода):${NC}"
+    read -p "Email'ы: " -r emails_input
+    if [[ "$emails_input" == "0" ]]; then
+        echo -e "${YELLOW}Операция отменена${NC}"
+        return 0
+    fi
+
+    # Фильтрация пустых строк (схлопывание пробелов)
+    local users=()
+    for u in $emails_input; do
+        if [[ -n "$u" ]]; then
+            users+=("$u")
+        fi
+    done
 
     if [[ ${#users[@]} -eq 0 ]]; then
         echo -e "${RED}Не введено ни одного email${NC}"
         return 1
     fi
 
-    if [[ ${#users[@]} -ne $count ]]; then
-        echo -e "${YELLOW}Внимание: указано $count, но введено ${#users[@]} email'ов${NC}"
-        read -p "Продолжить с ${#users[@]} пользователями? [y/N]: " confirm
+    # Проверка дубликатов внутри введённого списка
+    local unique_users=($(echo "${users[@]}" | tr ' ' '\n' | awk '!seen[$0]++'))
+    if [[ ${#unique_users[@]} -ne ${#users[@]} ]]; then
+        echo -e "${RED}⚠ Обнаружены дубликаты во введённом списке. Операция прервана.${NC}"
+        return 1
+    fi
 
-        if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-            echo -e "${RED}Операция отменена${NC}"
+    # Проверка дубликатов в выбранном inbound
+    local existing_emails=$(echo "$selected_inb" | jq -r '.settings.clients[]?.email // empty' 2>/dev/null)
+    for u in "${users[@]}"; do
+        if echo "$existing_emails" | grep -qx "$u"; then
+            echo -e "${RED}⚠ Email '$u' уже существует в $selected_tag. Операция прервана.${NC}"
+            return 1
+        fi
+    done
+
+    # Предложение бэкапа
+    read -p "Создать бэкап config.json перед изменениями? [Y/n]: " backup_choice
+    backup_choice=${backup_choice:-y}
+    if [[ "$backup_choice" =~ ^[Yy]$ ]]; then
+        local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+        local backup_file="${BACKUP_DIR}/${timestamp}-config.json.bak"
+        if cp "$CONFIG_PATH" "$backup_file"; then
+            echo -e "${GREEN}✓ Бэкап создан: $backup_file${NC}"
+        else
+            echo -e "${RED}✗ Ошибка создания бэкапа. Операция прервана.${NC}"
             return 1
         fi
     fi
 
-    local added_count=0
+    # Логика flow
+    local tag_lower=$(echo "$selected_tag" | tr '[:upper:]' '[:lower:]')
+    local flow_value="xtls-rprx-vision"
+    if [[ "$tag_lower" == *"smux"* ]]; then
+        flow_value=""
+    fi
 
+    local tmp_config=$(mktemp)
+    local clients_array="[]"
+    local current_date=$(date '+%Y-%m-%d %H:%M:%S')
+    local users_list_success=true
+
+    # Генерация UUID и подготовка JSON массива
     for email in "${users[@]}"; do
         local uuid=$(generate_uuid)
-        local tmp_config=$(mktemp)
+        clients_array=$(echo "$clients_array" | jq --arg e "$email" --arg u "$uuid" --arg f "$flow_value" \
+            '. + [{"email": $e, "id": $u, "flow": $f, "level": 0}]')
 
-        if jq --arg email "$email" --arg uuid "$uuid" '
-            .inbounds |= map(
-                if .tag == "VLESS-Vision-REALITY" then
-                    .settings = (.settings // {}) |
-                    .settings.clients = ((.settings.clients // []) + [{
-                        "email": $email,
-                        "id": $uuid,
-                        "flow": "",
-                        "level": 0
-                    }])
-                else
-                    .
-                end
-            )' "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
-            mv "$tmp_config" "$CONFIG_PATH"
-
-            echo "$email:$uuid:$(date '+%Y-%m-%d %H:%M:%S')" >> "$USERS_LIST"
-            echo -e "${GREEN}✓ Добавлен: $email (UUID: $uuid)${NC}"
-
-            ((added_count++))
-        else
-            rm -f "$tmp_config"
-            echo -e "${RED}✗ Ошибка добавления: $email${NC}"
+        # Запись в users.list
+        if ! echo "ADD:${selected_tag}:${email}:${uuid}:${current_date}" >> "$USERS_LIST"; then
+            users_list_success=false
         fi
     done
 
-    if [[ $added_count -gt 0 ]]; then
-        systemctl restart xray
-
-        echo -e "${GREEN}✓ Успешно добавлено $added_count из ${#users[@]} пользователей${NC}"
-        log_message "Добавлено $added_count пользователей"
+    # Применение изменений к конфигу
+    if jq --arg tag "$selected_tag" --argjson new_clients "$clients_array" '
+        .inbounds |= map(
+            if .tag == $tag then
+                .settings = (.settings // {}) |
+                .settings.clients = ((.settings.clients // []) + $new_clients)
+            else .
+            end
+        )
+    ' "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
+        mv "$tmp_config" "$CONFIG_PATH"
+        echo -e "${GREEN}✓ Успешно добавлено ${#users[@]} пользователей в $selected_tag${NC}"
+        log_message "Добавлено ${#users[@]} пользователей в $selected_tag"
     else
-        echo -e "${RED}✗ Не удалось добавить ни одного пользователя${NC}"
+        rm -f "$tmp_config"
+        echo -e "${RED}✗ Ошибка применения изменений к config.json${NC}"
+        return 1
     fi
+
+    if [[ "$users_list_success" == "false" ]]; then
+        echo -e "${RED}⚠ Внимание: не удалось обновить $USERS_LIST${NC}"
+    else
+        echo -e "${CYAN}Изменения записаны в ${USERS_LIST}${NC}"
+    fi
+
+    echo -e "${YELLOW}Не забудьте перезапустить Xray: ${GREEN}systemctl restart xray${NC}"
 }
 
 # --- Пакетное удаление пользователей ---
 batch_remove_users() {
     echo -e "${CYAN}=== Пакетное удаление пользователей ===${NC}"
-
     if [[ ! -f "$CONFIG_PATH" ]]; then
         echo -e "${RED}Конфиг не найден${NC}"
         return 1
     fi
 
-    if ! jq -e '.inbounds[] | select(.tag == "VLESS-Vision-REALITY")' "$CONFIG_PATH" >/dev/null 2>&1; then
-        echo -e "${RED}Inbound VLESS-Vision-REALITY не найден в config.json${NC}"
-        return 1
+    local vless_inbounds_json
+    vless_inbounds_json=$(jq -c '.inbounds[] | select(.protocol == "vless")' "$CONFIG_PATH" 2>/dev/null)
+
+    if [[ -z "$vless_inbounds_json" ]]; then
+        echo -e "${YELLOW}VLESS-inbounds не найдены${NC}"
+        return 0
     fi
 
-    echo -e "${YELLOW}Введите email'ы или UUID'ы для удаления (через пробел):${NC}"
-    read -p "Значения: " -a search_values
+    local inbounds=()
+    local tags=()
+    local has_untagged=false
+
+    while IFS= read -r inb; do
+        local tag=$(echo "$inb" | jq -r '.tag // empty')
+        if [[ -z "$tag" ]]; then
+            has_untagged=true
+            continue
+        fi
+        inbounds+=("$inb")
+        tags+=("$tag")
+    done <<< "$vless_inbounds_json"
+
+    if [[ "$has_untagged" == "true" ]]; then
+        echo -e "${YELLOW}⚠ Найден VLESS-inbound без tag, он пропущен${NC}"
+    fi
+
+    if [[ ${#tags[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Нет доступных VLESS-inbounds с тегами${NC}"
+        return 0
+    fi
+
+    echo -e "${CYAN}Доступные VLESS-inbounds (можно выбрать несколько через пробел):${NC}"
+    for i in "${!tags[@]}"; do
+        echo -e "${CYAN}$((i+1)). ${tags[$i]}${NC}"
+    done
+    echo -e "${CYAN}0. Выход в главное меню${NC}"
+
+    local selected_tags=()
+    while true; do
+        read -p "Выберите inbound'ы [1-${#tags[@]}] через пробел или 0 для выхода: " -r choices_input
+        if [[ "$choices_input" == "0" ]]; then
+            echo -e "${YELLOW}Операция отменена${NC}"
+            return 0
+        fi
+
+        local valid=true
+        local chosen_indices=()
+        for c in $choices_input; do
+            if [[ "$c" =~ ^[0-9]+$ && "$c" -ge 1 && "$c" -le "${#tags[@]}" ]]; then
+                chosen_indices+=("$c")
+            else
+                valid=false
+                break
+            fi
+        done
+
+        if [[ "$valid" == "true" && ${#chosen_indices[@]} -gt 0 ]]; then
+            # Убираем дубликаты номеров
+            local unique_indices=($(echo "${chosen_indices[@]}" | tr ' ' '\n' | awk '!seen[$0]++'))
+            for idx in "${unique_indices[@]}"; do
+                selected_tags+=("${tags[$((idx-1))]}")
+            done
+            break
+        else
+            echo -e "${RED}Неверный ввод, повторите попытку${NC}"
+        fi
+    done
+
+    echo -e "${YELLOW}Введите email'ы или UUID'ы для удаления через пробел (0 для выхода):${NC}"
+    read -p "Значения: " -r search_input
+    if [[ "$search_input" == "0" ]]; then
+        echo -e "${YELLOW}Операция отменена${NC}"
+        return 0
+    fi
+
+    local search_values=()
+    for v in $search_input; do
+        if [[ -n "$v" ]]; then
+            search_values+=("$v")
+        fi
+    done
 
     if [[ ${#search_values[@]} -eq 0 ]]; then
         echo -e "${RED}Не введено ни одного значения${NC}"
         return 1
     fi
 
-    local found_count=0
-    local not_found=()
-    local tmp_config=$(mktemp)
+    # Предложение бэкапа
+    read -p "Создать бэкап config.json перед изменениями? [Y/n]: " backup_choice
+    backup_choice=${backup_choice:-y}
+    if [[ "$backup_choice" =~ ^[Yy]$ ]]; then
+        local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+        local backup_file="${BACKUP_DIR}/${timestamp}-config.json.bak"
+        if cp "$CONFIG_PATH" "$backup_file"; then
+            echo -e "${GREEN}✓ Бэкап создан: $backup_file${NC}"
+        else
+            echo -e "${RED}✗ Ошибка создания бэкапа. Операция прервана.${NC}"
+            return 1
+        fi
+    fi
 
+    local tmp_config=$(mktemp)
     cp "$CONFIG_PATH" "$tmp_config"
 
+    local found_count=0
+    local not_found_values=()
+    local current_date=$(date '+%Y-%m-%d %H:%M:%S')
+    local users_list_success=true
+
     for value in "${search_values[@]}"; do
-        local found=false
+        local found_in_any=false
+        local is_uuid=false
 
         if [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            if jq -e --arg uuid "$value" '
-                [
-                    .inbounds[]
-                    | select(.tag == "VLESS-Vision-REALITY")
-                    | .settings.clients? // []
-                    | .[]
-                    | select(.id == $uuid)
-                ] | length > 0
-            ' "$tmp_config" >/dev/null 2>&1; then
-                if jq --arg uuid "$value" '
-                    .inbounds |= map(
-                        if .tag == "VLESS-Vision-REALITY" and ((.settings.clients | type) == "array") then
-                            .settings.clients |= map(select((.id // "") != $uuid))
-                        else
-                            .
-                        end
-                    )
-                ' "$tmp_config" > "${tmp_config}.tmp" 2>/dev/null; then
-                    mv "${tmp_config}.tmp" "$tmp_config"
-                    found=true
-                fi
-            fi
-        else
-            if jq -e --arg email "$value" '
-                [
-                    .inbounds[]
-                    | select(.tag == "VLESS-Vision-REALITY")
-                    | .settings.clients? // []
-                    | .[]
-                    | select(.email == $email)
-                ] | length > 0
-            ' "$tmp_config" >/dev/null 2>&1; then
-                if jq --arg email "$value" '
-                    .inbounds |= map(
-                        if .tag == "VLESS-Vision-REALITY" and ((.settings.clients | type) == "array") then
-                            .settings.clients |= map(select((.email // "") != $email))
-                        else
-                            .
-                        end
-                    )
-                ' "$tmp_config" > "${tmp_config}.tmp" 2>/dev/null; then
-                    mv "${tmp_config}.tmp" "$tmp_config"
-                    found=true
-                fi
-            fi
+            is_uuid=true
         fi
 
-        if [[ "$found" == "true" ]]; then
-            ((found_count++))
-            echo -e "${GREEN}✓ Удалён: $value${NC}"
-        else
-            not_found+=("$value")
+        for tag in "${selected_tags[@]}"; do
+            local client_info=""
+            if [[ "$is_uuid" == "true" ]]; then
+                client_info=$(jq -r --arg tag "$tag" --arg uuid "$value" '
+                    .inbounds[] | select(.tag == $tag) | .settings.clients[]? | select(.id == $uuid) | "\(.email // "no-email")\t\(.id)"
+                ' "$tmp_config" 2>/dev/null)
+            else
+                client_info=$(jq -r --arg tag "$tag" --arg email "$value" '
+                    .inbounds[] | select(.tag == $tag) | .settings.clients[]? | select(.email == $email) | "\(.email // "no-email")\t\(.id)"
+                ' "$tmp_config" 2>/dev/null)
+            fi
+
+            if [[ -n "$client_info" ]]; then
+                found_in_any=true
+                while IFS= read -r info; do
+                    local c_email=$(echo "$info" | cut -d$'\t' -f1)
+                    local c_uuid=$(echo "$info" | cut -d$'\t' -f2)
+
+                    # Удаление из конфига
+                    if [[ "$is_uuid" == "true" ]]; then
+                        jq --arg tag "$tag" --arg uuid "$value" '
+                            .inbounds |= map(if .tag == $tag then .settings.clients |= map(select(.id != $uuid)) else . end)
+                        ' "$tmp_config" > "${tmp_config}.tmp" && mv "${tmp_config}.tmp" "$tmp_config"
+                    else
+                        jq --arg tag "$tag" --arg email "$value" '
+                            .inbounds |= map(if .tag == $tag then .settings.clients |= map(select(.email != $email)) else . end)
+                        ' "$tmp_config" > "${tmp_config}.tmp" && mv "${tmp_config}.tmp" "$tmp_config"
+                    fi
+
+                    # Запись в users.list
+                    if ! echo "DEL:${tag}:${c_email}:${c_uuid}:${current_date}" >> "$USERS_LIST"; then
+                        users_list_success=false
+                    fi
+                    ((found_count++))
+                done <<< "$client_info"
+            else
+                echo -e "${RED}⚠ $value не найден в $tag${NC}"
+            fi
+        done
+
+        if [[ "$found_in_any" == "false" ]]; then
+            not_found_values+=("$value")
         fi
     done
 
     if [[ $found_count -gt 0 ]]; then
         mv "$tmp_config" "$CONFIG_PATH"
-        systemctl restart xray
-
-        echo -e "${GREEN}✓ Удалено $found_count пользователей${NC}"
-        log_message "Удалено $found_count пользователей"
+        echo -e "${GREEN}✓ Удалено $found_count записей(и)${NC}"
+        log_message "Удалено $found_count записей(и)"
     else
         rm -f "$tmp_config"
     fi
-
     rm -f "${tmp_config}.tmp"
 
-    if [[ ${#not_found[@]} -gt 0 ]]; then
-        echo -e "${RED}Не найдены:${NC}"
-        for val in "${not_found[@]}"; do
-            echo -e "${RED}  - $val${NC}"
-        done
+    if [[ ${#not_found_values[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}⚠ Не найдено ни в одном из выбранных inbound'ов: ${not_found_values[*]}${NC}"
+    fi
+
+    if [[ $found_count -gt 0 ]]; then
+        if [[ "$users_list_success" == "false" ]]; then
+            echo -e "${RED}⚠ Внимание: не удалось обновить $USERS_LIST${NC}"
+        else
+            echo -e "${CYAN}Изменения записаны в ${USERS_LIST}${NC}"
+        fi
+        echo -e "${YELLOW}Не забудьте перезапустить Xray: ${GREEN}systemctl restart xray${NC}"
     fi
 }
 
@@ -2112,56 +2308,76 @@ server_stats() {
 # --- Генерация VLESS ссылок ---
 generate_vless_links() {
     echo -e "${CYAN}=== Генерация VLESS ссылок ===${NC}"
-
     if [[ ! -f "$CONFIG_PATH" ]]; then
         echo -e "${RED}Конфиг не найден${NC}"
         return 1
     fi
 
-    if ! jq -e '.inbounds[] | select(.tag == "VLESS-Vision-REALITY")' "$CONFIG_PATH" >/dev/null 2>&1; then
-        echo -e "${RED}Inbound VLESS-Vision-REALITY не найден в config.json${NC}"
-        return 1
+    local vless_inbounds_json
+    vless_inbounds_json=$(jq -c '.inbounds[] | select(.protocol == "vless")' "$CONFIG_PATH" 2>/dev/null)
+
+    if [[ -z "$vless_inbounds_json" ]]; then
+        echo -e "${YELLOW}VLESS-inbounds не найдены${NC}"
+        return 0
     fi
 
-    echo -e "${YELLOW}Получение IP сервера...${NC}"
-    local server_ip=$(curl -s ifconfig.me)
+    local inbounds=()
+    local tags=()
+    local has_untagged=false
 
+    while IFS= read -r inb; do
+        local tag=$(echo "$inb" | jq -r '.tag // empty')
+        if [[ -z "$tag" ]]; then
+            has_untagged=true
+            continue
+        fi
+        inbounds+=("$inb")
+        tags+=("$tag")
+    done <<< "$vless_inbounds_json"
+
+    if [[ "$has_untagged" == "true" ]]; then
+        echo -e "${YELLOW}⚠ Найден VLESS-inbound без tag, он пропущен${NC}"
+    fi
+
+    if [[ ${#tags[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Нет доступных VLESS-inbounds с тегами${NC}"
+        return 0
+    fi
+
+    echo -e "${CYAN}Доступные VLESS-inbounds:${NC}"
+    for i in "${!tags[@]}"; do
+        echo -e "${CYAN}$((i+1)). ${tags[$i]}${NC}"
+    done
+    echo -e "${CYAN}0. Выход в главное меню${NC}"
+
+    local choice
+    while true; do
+        read -p "Выберите inbound [1-${#tags[@]}] или 0 для выхода: " choice
+        if [[ "$choice" == "0" ]]; then
+            echo -e "${YELLOW}Операция отменена${NC}"
+            return 0
+        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#tags[@]}" ]]; then
+            break
+        else
+            echo -e "${RED}Неверный ввод, повторите попытку${NC}"
+        fi
+    done
+
+    local selected_idx=$((choice-1))
+    local selected_tag="${tags[$selected_idx]}"
+    local selected_inb="${inbounds[$selected_idx]}"
+
+    echo -e "${YELLOW}Получение IP сервера...${NC}"
+    local server_ip=$(curl -s -4 ifconfig.me || curl -s -4 api.ipify.org)
     if [[ -z "$server_ip" ]]; then
         echo -e "${RED}Не удалось получить IP${NC}"
         return 1
     fi
-
     echo -e "${GREEN}IP сервера: $server_ip${NC}"
 
-    local domain=$(jq -r '
-        .inbounds[]
-        | select(.tag == "VLESS-Vision-REALITY")
-        | .streamSettings.realitySettings.serverNames[0] // empty
-    ' "$CONFIG_PATH")
-
-    local private_key=$(jq -r '
-        .inbounds[]
-        | select(.tag == "VLESS-Vision-REALITY")
-        | .streamSettings.realitySettings.privateKey // empty
-    ' "$CONFIG_PATH")
-
-    local short_id=$(jq -r '
-        .inbounds[]
-        | select(.tag == "VLESS-Vision-REALITY")
-        | .streamSettings.realitySettings.shortIds[0] // empty
-    ' "$CONFIG_PATH")
-
-    if [[ -z "$domain" || -z "$private_key" || -z "$short_id" ]]; then
-        echo -e "${RED}Не найдены параметры VLESS-Vision-REALITY в config.json${NC}"
-        return 1
-    fi
-
-    local public_key=$($XRAY_BIN x25519 -i "$private_key" 2>/dev/null | awk -F': ' 'NR==2 {print $2}')
-
-    if [[ -z "$public_key" ]]; then
-        echo -e "${RED}Не удалось получить public key из private key${NC}"
-        return 1
-    fi
+    local port=$(echo "$selected_inb" | jq -r '.port // "443"')
+    local network=$(echo "$selected_inb" | jq -r '.streamSettings.network // "tcp"')
+    local security=$(echo "$selected_inb" | jq -r '.streamSettings.security // "none"')
 
     echo -e "${YELLOW}Выберите fingerprint:${NC}"
     echo -e "${CYAN}1. chrome${NC}"
@@ -2169,64 +2385,112 @@ generate_vless_links() {
     echo -e "${CYAN}3. safari${NC}"
     echo -e "${CYAN}4. edge${NC}"
     echo -e "${CYAN}5. random${NC}"
-
-    read -p "Выбор [1-5]: " fp_choice
-
-    local fp=""
-
+    read -p "Выбор [1-5] (Enter для random): " fp_choice
+    local fp="random"
     case "$fp_choice" in
         1) fp="chrome" ;;
         2) fp="firefox" ;;
         3) fp="safari" ;;
         4) fp="edge" ;;
         5) fp="random" ;;
-        *)
-            echo -e "${RED}Неверный выбор${NC}"
-            return 1
-            ;;
     esac
 
-    echo -e "${YELLOW}Введите email'ы клиентов (через пробел):${NC}"
-    read -p "Email'ы: " -a emails
+    echo -e "${YELLOW}Введите email'ы или UUID'ы клиентов через пробел (0 для выхода):${NC}"
+    read -p "Значения: " -r users_input
+    if [[ "$users_input" == "0" ]]; then
+        echo -e "${YELLOW}Операция отменена${NC}"
+        return 0
+    fi
 
-    if [[ ${#emails[@]} -eq 0 ]]; then
-        echo -e "${RED}Не введено ни одного email${NC}"
+    local search_values=()
+    for v in $users_input; do
+        if [[ -n "$v" ]]; then
+            search_values+=("$v")
+        fi
+    done
+
+    if [[ ${#search_values[@]} -eq 0 ]]; then
+        echo -e "${RED}Не введено ни одного значения${NC}"
         return 1
     fi
 
-    for email in "${emails[@]}"; do
-        local client_json=$(jq -c --arg email "$email" '
-            .inbounds[]
-            | select(.tag == "VLESS-Vision-REALITY")
-            | .settings.clients? // []
-            | .[]
-            | select(.email == $email)
-        ' "$CONFIG_PATH" | head -n 1)
+    for value in "${search_values[@]}"; do
+        local client_json=""
+        local is_uuid=false
+
+        if [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            is_uuid=true
+            client_json=$(echo "$selected_inb" | jq -c --arg uuid "$value" '.settings.clients[]? | select(.id == $uuid)' 2>/dev/null | head -n 1)
+        else
+            client_json=$(echo "$selected_inb" | jq -c --arg email "$value" '.settings.clients[]? | select(.email == $email)' 2>/dev/null | head -n 1)
+        fi
 
         if [[ -z "$client_json" ]]; then
-            echo -e "${RED}Пользователь $email не найден${NC}"
+            echo -e "${RED}⚠ Пользователь $value не найден в $selected_tag${NC}"
             continue
         fi
 
         local uuid=$(echo "$client_json" | jq -r '.id // empty')
+        local email=$(echo "$client_json" | jq -r '.email // empty')
         local flow=$(echo "$client_json" | jq -r '.flow // empty')
 
         if [[ -z "$uuid" ]]; then
-            echo -e "${RED}Не удалось получить UUID для $email${NC}"
+            echo -e "${RED}Не удалось получить UUID для $value${NC}"
             continue
         fi
 
-        local link="vless://${uuid}@${server_ip}:443?type=tcp&security=reality&sni=${domain}&fp=${fp}&pbk=${public_key}&sid=${short_id}"
+        local display_name="${email:-$uuid}"
 
+        # Сборка параметров ссылки
+        local link_params="type=${network}&security=${security}"
+
+        if [[ "$security" == "reality" ]]; then
+            local sni=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.serverNames[0] // empty')
+            local private_key=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.privateKey // empty')
+            local short_id=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.shortIds[0] // empty')
+
+            if [[ -z "$sni" || -z "$private_key" ]]; then
+                echo -e "${RED}Ошибка: не найдены параметры Reality для $selected_tag${NC}"
+                continue
+            fi
+
+            local public_key=$($XRAY_BIN x25519 -i "$private_key" 2>/dev/null | awk -F': ' 'NR==2 {print $2}')
+            if [[ -z "$public_key" ]]; then
+                echo -e "${RED}Не удалось получить public key для $selected_tag${NC}"
+                continue
+            fi
+
+            link_params+="&sni=${sni}&fp=${fp}&pbk=${public_key}"
+            [[ -n "$short_id" ]] && link_params+="&sid=${short_id}"
+        elif [[ "$security" == "tls" ]]; then
+            local sni=$(echo "$selected_inb" | jq -r '.streamSettings.tlsSettings.serverName // empty')
+            [[ -n "$sni" ]] && link_params+="&sni=${sni}&fp=${fp}"
+        fi
+
+        if [[ "$network" == "ws" ]]; then
+            local path=$(echo "$selected_inb" | jq -r '.streamSettings.wsSettings.path // "/"')
+            local host=$(echo "$selected_inb" | jq -r '.streamSettings.wsSettings.headers.Host // empty')
+            link_params+="&path=$(printf %s "$path" | jq -sRr @uri)"
+            [[ -n "$host" ]] && link_params+="&host=$(printf %s "$host" | jq -sRr @uri)"
+        elif [[ "$network" == "grpc" ]]; then
+            local serviceName=$(echo "$selected_inb" | jq -r '.streamSettings.grpcSettings.serviceName // empty')
+            [[ -n "$serviceName" ]] && link_params+="&serviceName=${serviceName}"
+        elif [[ "$network" == "httpupgrade" ]]; then
+            local path=$(echo "$selected_inb" | jq -r '.streamSettings.httpupgradeSettings.path // "/"')
+            local host=$(echo "$selected_inb" | jq -r '.streamSettings.httpupgradeSettings.host // empty')
+            link_params+="&path=$(printf %s "$path" | jq -sRr @uri)"
+            [[ -n "$host" ]] && link_params+="&host=$(printf %s "$host" | jq -sRr @uri)"
+        fi
+
+        local link="vless://${uuid}@${server_ip}:${port}?${link_params}"
         if [[ -n "$flow" ]]; then
             link+="&flow=${flow}"
         fi
+        # URL-кодирование имени в хэше ссылки
+        link+="#$(printf %s "$display_name" | jq -sRr @uri)"
 
-        link+="#${email}"
-
-        echo -e "${CYAN}Ссылка для $email:${NC}"
-        echo -e "${GREEN}VLESS-TCP-Reality:${NC}"
-        echo "$link"
+        echo -e "${CYAN}Ссылка для $display_name:${NC}"
+        echo -e "${GREEN}${link}${NC}"
         echo
     done
 }
