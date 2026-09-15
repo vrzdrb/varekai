@@ -1661,10 +1661,15 @@ batch_add_users() {
     local clients_array="[]"
     local current_date=$(date '+%Y-%m-%d %H:%M:%S')
     local users_list_success=true
+    local added_report=()
 
     # Генерация UUID и подготовка JSON массива
     for email in "${users[@]}"; do
         local uuid=$(generate_uuid)
+
+        # Сохраняем для красивого вывода
+        added_report+=("${email} --- ${uuid}")
+
         clients_array=$(echo "$clients_array" | jq --arg e "$email" --arg u "$uuid" --arg f "$flow_value" \
             '. + [{"email": $e, "id": $u, "flow": $f, "level": 0}]')
 
@@ -1685,8 +1690,24 @@ batch_add_users() {
         )
     ' "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
         mv "$tmp_config" "$CONFIG_PATH"
-        echo -e "${GREEN}✓ Успешно добавлено ${#users[@]} пользователей в $selected_tag${NC}"
-        log_message "Добавлено ${#users[@]} пользователей в $selected_tag"
+        local count=${#users[@]}
+        local word="пользователей"
+
+        if (( count % 10 == 1 && count % 100 != 11 )); then
+            word="пользователь"
+        elif (( count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 10 || count % 100 >= 20) )); then
+            word="пользователя"
+        else
+            word="пользователей"
+        fi
+
+        echo -e "${GREEN}✓ Успешно добавлено ${count} ${word}!${NC}"
+
+        for line in "${added_report[@]}"; do
+            echo -e "${CYAN}${line}${NC}"
+        done
+
+        log_message "Добавлено ${count} пользователей в $selected_tag"
     else
         rm -f "$tmp_config"
         echo -e "${RED}✗ Ошибка применения изменений к config.json${NC}"
