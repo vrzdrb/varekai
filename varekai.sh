@@ -1121,14 +1121,28 @@ setup_tcp_brutal() {
             if bash <(curl -fsSL https://tcp.hy2.sh/); then
                 # Загрузка модуля
                 modprobe brutal 2>/dev/null || true
-
+    
                 # Включение Brutal как алгоритма по умолчанию
                 sysctl -w net.ipv4.tcp_congestion_control=brutal > /dev/null 2>&1
                 sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
+    
+                # === ПРОВЕРКА: модуль реально активен ===
+                local actual_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+                if [[ "$actual_cc" != "brutal" ]]; then
+                    echo -e "${RED}✗ Модуль НЕ активен (текущий cc: ${actual_cc})${NC}"
+                    echo -e "${YELLOW}Установщик отработал, но алгоритм не применился.${NC}"
+                    echo -e "${YELLOW}Проверьте: dmesg | tail -20 и modinfo brutal${NC}"
+                    return 1
+                fi
 
+                # Автозагрузка модуля при старте системы
+                echo "brutal" > /etc/modules-load.d/brutal.conf
+    
                 # Сохранение в sysctl.conf для персистентности
                 if ! grep -q "tcp_congestion_control=brutal" /etc/sysctl.conf; then
                     echo "net.ipv4.tcp_congestion_control=brutal" >> /etc/sysctl.conf
+                fi
+                if ! grep -q "default_qdisc=fq" /etc/sysctl.conf; then
                     echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
                 fi
 
@@ -1166,6 +1180,20 @@ setup_tcp_brutal() {
     fi
 
     echo
+
+    # === СТРАЖ: не писать brutal в конфиг, если модуль не активен ===
+    local actual_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    if [[ "$actual_cc" != "brutal" ]]; then
+        # На случай, если модуль установлен, но не прописан в автозагрузку
+        if lsmod | grep -q "^brutal"; then
+            echo "brutal" > /etc/modules-load.d/brutal.conf
+        fi
+        echo -e "${RED}Модуль brutal не активен (текущий cc: ${actual_cc})${NC}"
+        echo -e "${YELLOW}Запись brutal в config.json отменена — иначе inbound перестанет принимать соединения.${NC}"
+        return 1
+    fi
+
+    # Шаг 2: Проверка и настройка в config.json
 
     # Шаг 2: Проверка и настройка в config.json
     if [[ ! -f "$CONFIG_PATH" ]]; then
@@ -1211,7 +1239,8 @@ setup_tcp_brutal() {
     echo -e "${CYAN}Выберите inbound для настройки:${NC}"
     echo -e "${CYAN}0. Настроить все inbound'ы сразу${NC}"
 
-    read -p "Выбор [0-$((i-1))]: " inbound_choice
+    read -p "Выбор [1-$((i-1))] (Enter = все): " inbound_choice
+    inbound_choice=${inbound_choice:-0}
 
     if [[ ! "$inbound_choice" =~ ^[0-9]+$ || "$inbound_choice" -gt "$((i-1))" ]]; then
         echo -e "${RED}Неверный выбор${NC}"
@@ -1284,7 +1313,21 @@ setup_tcp_brutal() {
     done
 
     if [[ $update_count -gt 0 ]]; then
+        # Бэкап перед применением
+        local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+        local backup_file="${BACKUP_DIR}/${timestamp}-config-before-brutal.json.bak"
+        cp "$CONFIG_PATH" "$backup_file"
+        echo -e "${GREEN}✓ Бэкап создан: $backup_file${NC}"
+
+        # Проверка конфига ДО применения
+        if ! $XRAY_BIN run -test -config "$tmp_config" > /dev/null 2>&1; then
+            echo -e "${RED}Новый конфиг не прошёл проверку xray! Изменения отменены.${NC}"
+            rm -f "$tmp_config"
+            return 1
+        fi
+
         mv "$tmp_config" "$CONFIG_PATH"
+        chmod 644 "$CONFIG_PATH"
 
         # Перезапуск Xray
         if systemctl restart xray; then
@@ -1331,13 +1374,13 @@ update_routing() {
     fi
     echo -e "${YELLOW}Скачивание routing.json...${NC}"
     local tmp_file=$(mktemp)
-    if ! curl -sL "$ROUTING_URL" -o "$tmp_file"; then
-        echo -e "${RED}Ошибка скачивания routing${NC}"
+    # -f: не сохранять тело при HTTP-ошибках (404/500)
+    if ! curl -sfL "$ROUTING_URL" -o "$tmp_file"; then
+        echo -e "${RED}Ошибка скачивания routing (HTTP или сеть)${NC}"
         rm -f "$tmp_file"
         return 1
     fi
 
-    # Проверка валидности JSON (jq empty - самый надёжный способ)
     if ! jq empty "$tmp_file" 2>/dev/null; then
         echo -e "${RED}Скачанный файл не является валидным JSON${NC}"
         rm -f "$tmp_file"
@@ -1345,32 +1388,40 @@ update_routing() {
     fi
 
     local routing_obj=""
-    # Проверяем, скачали мы целый конфиг с полем .routing или просто сам объект routing
     if jq -e '.routing' "$tmp_file" > /dev/null 2>&1; then
         routing_obj=$(jq '.routing' "$tmp_file")
     else
         routing_obj=$(jq '.' "$tmp_file")
     fi
 
-    # Автоматический бэкап перед изменением (для спокойствия)
-    local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
-    local backup_file="${BACKUP_DIR}/${timestamp}-config-before-routing.json.bak"
-    if cp "$CONFIG_PATH" "$backup_file"; then
-        echo -e "${GREEN}✓ Создан автоматический бэкап: $backup_file${NC}"
-    else
-        echo -e "${YELLOW}⚠ Не удалось создать бэкап, но продолжаем...${NC}"
+    # === КЛЮЧЕВАЯ ДОБАВКА: проверка структуры ===
+    if ! echo "$routing_obj" | jq -e 'type == "object" and (.rules | type == "array")' > /dev/null 2>&1; then
+        echo -e "${RED}Скачанный файл не похож на routing: нет объекта с массивом rules.${NC}"
+        echo -e "${YELLOW}Первые 200 байт ответа:${NC}"
+        head -c 200 "$tmp_file"; echo
+        rm -f "$tmp_file"
+        return 1
     fi
 
+    local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    local backup_file="${BACKUP_DIR}/${timestamp}-config-before-routing.json.bak"
+    cp "$CONFIG_PATH" "$backup_file" && echo -e "${GREEN}✓ Бэкап: $backup_file${NC}"
+
     local tmp_config=$(mktemp)
-    # Применяем изменения. Важно: 2>/dev/null, чтобы случайные warnings не попали в JSON
     if jq --argjson routing "$routing_obj" '.routing = $routing' "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
+        # === ДОБАВКА: тест конфига перед применением ===
+        if ! $XRAY_BIN run -test -config "$tmp_config" > /dev/null 2>&1; then
+            echo -e "${RED}Новый конфиг не прошёл проверку xray! Изменения отменены.${NC}"
+            rm -f "$tmp_config" "$tmp_file"
+            return 1
+        fi
         mv "$tmp_config" "$CONFIG_PATH"
-        chmod 644 "$CONFIG_PATH" # Возвращаем правильные права доступа после mv
+        chmod 644 "$CONFIG_PATH"
         systemctl restart xray
         echo -e "${GREEN}✓ Routing успешно обновлён!${NC}"
         log_message "Routing обновлён из $ROUTING_URL"
     else
-        echo -e "${RED}Ошибка обновления конфига (jq не смог применить изменения)${NC}"
+        echo -e "${RED}Ошибка обновления конфига${NC}"
         rm -f "$tmp_config"
     fi
     rm -f "$tmp_file"
@@ -2516,6 +2567,160 @@ generate_vless_links() {
     done
 }
 
+# --- Генерация Mihomo proxy ---
+generate_mihomo_proxies() {
+    echo -e "${CYAN}=== Генерация Mihomo proxy ===${NC}"
+    if [[ ! -f "$CONFIG_PATH" ]]; then
+        echo -e "${RED}Конфиг не найден${NC}"
+        return 1
+    fi
+
+    local vless_inbounds_json
+    vless_inbounds_json=$(jq -c '.inbounds[] | select(.protocol == "vless")' "$CONFIG_PATH" 2>/dev/null)
+
+    if [[ -z "$vless_inbounds_json" ]]; then
+        echo -e "${YELLOW}VLESS-inbounds не найдены${NC}"
+        return 0
+    fi
+
+    local inbounds=()
+    local tags=()
+    local has_untagged=false
+
+    while IFS= read -r inb; do
+        local tag=$(echo "$inb" | jq -r '.tag // empty')
+        if [[ -z "$tag" ]]; then
+            has_untagged=true
+            continue
+        fi
+        inbounds+=("$inb")
+        tags+=("$tag")
+    done <<< "$vless_inbounds_json"
+
+    if [[ "$has_untagged" == "true" ]]; then
+        echo -e "${YELLOW}⚠ Найден VLESS-inbound без tag, он пропущен${NC}"
+    fi
+
+    if [[ ${#tags[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Нет доступных VLESS-inbounds с тегами${NC}"
+        return 0
+    fi
+
+    echo -e "${CYAN}Доступные VLESS-inbounds:${NC}"
+    for i in "${!tags[@]}"; do
+        echo -e "${CYAN}$((i+1)). ${tags[$i]}${NC}"
+    done
+    echo -e "${CYAN}0. Выход в главное меню${NC}"
+
+    local choice
+    while true; do
+        read -p "Выберите inbound [1-${#tags[@]}] или 0 для выхода: " choice
+        if [[ "$choice" == "0" ]]; then
+            echo -e "${YELLOW}Операция отменена${NC}"
+            return 0
+        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#tags[@]}" ]]; then
+            break
+        else
+            echo -e "${RED}Неверный ввод, повторите попытку${NC}"
+        fi
+    done
+
+    local selected_idx=$((choice-1))
+    local selected_tag="${tags[$selected_idx]}"
+    local selected_inb="${inbounds[$selected_idx]}"
+
+    echo -e "${YELLOW}Получение IP сервера...${NC}"
+    local server_ip=$(curl -s -4 ifconfig.me || curl -s -4 api.ipify.org)
+    if [[ -z "$server_ip" ]]; then
+        echo -e "${RED}Не удалось получить IP${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}IP сервера: $server_ip${NC}"
+
+    local security=$(echo "$selected_inb" | jq -r '.streamSettings.security // "none"')
+
+    # Параметры security одинаковы для всех пользователей — получаем один раз
+    local sni="" public_key="" short_id=""
+    if [[ "$security" == "reality" ]]; then
+        sni=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.serverNames[0] // empty')
+        local private_key=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.privateKey // empty')
+        short_id=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.shortIds[0] // empty')
+
+        if [[ -z "$sni" || -z "$private_key" ]]; then
+            echo -e "${RED}Ошибка: не найдены параметры Reality для $selected_tag${NC}"
+            return 1
+        fi
+
+        public_key=$($XRAY_BIN x25519 -i "$private_key" 2>/dev/null | awk -F': ' 'NR==2 {print $2}')
+        if [[ -z "$public_key" ]]; then
+            echo -e "${RED}Не удалось получить public key для $selected_tag${NC}"
+            return 1
+        fi
+    elif [[ "$security" == "tls" ]]; then
+        sni=$(echo "$selected_inb" | jq -r '.streamSettings.tlsSettings.serverName // empty')
+    fi
+
+    echo -e "${YELLOW}Введите email'ы или UUID'ы клиентов через пробел (0 для выхода):${NC}"
+    read -p "Значения: " -r users_input
+    if [[ "$users_input" == "0" ]]; then
+        echo -e "${YELLOW}Операция отменена${NC}"
+        return 0
+    fi
+
+    local search_values=()
+    for v in $users_input; do
+        if [[ -n "$v" ]]; then
+            search_values+=("$v")
+        fi
+    done
+
+    if [[ ${#search_values[@]} -eq 0 ]]; then
+        echo -e "${RED}Не введено ни одного значения${NC}"
+        return 1
+    fi
+
+    echo
+    echo -e "${YELLOW}proxies:${NC}"
+
+    for value in "${search_values[@]}"; do
+        local client_json=""
+
+        if [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            client_json=$(echo "$selected_inb" | jq -c --arg uuid "$value" '.settings.clients[]? | select(.id == $uuid)' 2>/dev/null | head -n 1)
+        else
+            client_json=$(echo "$selected_inb" | jq -c --arg email "$value" '.settings.clients[]? | select(.email == $email)' 2>/dev/null | head -n 1)
+        fi
+
+        if [[ -z "$client_json" ]]; then
+            echo -e "${RED}⚠ Пользователь $value не найден в $selected_tag${NC}" >&2
+            continue
+        fi
+
+        local uuid=$(echo "$client_json" | jq -r '.id // empty')
+        local email=$(echo "$client_json" | jq -r '.email // empty')
+
+        if [[ -z "$uuid" ]]; then
+            echo -e "${RED}Не удалось получить UUID для $value${NC}" >&2
+            continue
+        fi
+
+        local display_name="${email:-$uuid}"
+        local name_quoted=$(printf %s "$display_name" | jq -sRr @json)
+
+        echo "  - name: ${name_quoted}"
+        echo "    server: ${server_ip}"
+        echo "    uuid: ${uuid}"
+        if [[ -n "$sni" ]]; then
+            echo "    servername: ${sni}"
+        fi
+        if [[ "$security" == "reality" ]]; then
+            echo "    reality-opts:"
+            echo "      public-key: ${public_key}"
+            [[ -n "$short_id" ]] && echo "      short-id: ${short_id}"
+        fi
+    done
+}
+
 # --- Главное меню ---
 show_menu() {
     clear
@@ -2543,6 +2748,7 @@ show_menu() {
     echo -e "${BRIGHT_RED}12. ${CYAN}Просмотр статистики пользователя${NC}"
     echo -e "${BRIGHT_RED}13. ${CYAN}Просмотр статистики сервера${NC}"
     echo -e "${BRIGHT_RED}14. ${CYAN}Выдать ключ vless://${NC}"
+    echo -e "${BRIGHT_RED}15. ${CYAN}Выдать Mihomo proxy${NC}"    
     echo -e "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-"
     echo -e "${BRIGHT_RED}15. ${CYAN}Быстрый перезапуск Xray${NC}"
     echo -e "${BRIGHT_RED}0. ${CYAN}Выход${NC}"
@@ -2560,7 +2766,7 @@ main() {
 
     while true; do
         show_menu
-        read -p "Выберите пункт меню [0-15]: " choice
+        read -p "Выберите пункт меню [0-16]: " choice
 
         case "$choice" in
             1) install_xray ;;           # Установка Xray
@@ -2577,8 +2783,9 @@ main() {
             12) user_stats ;;            # Просмотр статистики пользователя
             13) server_stats ;;          # Просмотр статистики сервера
             14) generate_vless_links ;;  # Выдать ключ vless://
-            15) restart_xray_status ;;   # Быстрый перезапуск Xray
-            0)
+            15) generate_mihomo_proxies ;;   # Выдать Mihomo proxy
+            16) restart_xray_status ;;       # Быстрый перезапуск Xray
+	    0)
                 exit 0
                 ;;
             *)
