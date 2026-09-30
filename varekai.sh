@@ -1269,7 +1269,7 @@ setup_tcp_brutal() {
     [[ ! "$enable_confirm" =~ ^[Yy]$ ]] && enabled="false"
 
     # Применение изменений
-    local tmp_config=$(mktemp)
+    local tmp_config=$(mktemp --suffix=.json)
     local tags_to_update=()
 
     if [[ "$inbound_choice" == "0" ]]; then
@@ -1289,7 +1289,7 @@ setup_tcp_brutal() {
         if jq --arg tag "$tag" \
               --arg enabled "$enabled" \
               --arg up "$up_speed" \
-              --arg down "$down_speed" \
+              --arg down "$down_speed" 
             '.inbounds |= map(
                 if .tag == $tag then
                     .smux = (.smux // {}) |
@@ -1410,7 +1410,7 @@ update_routing() {
     local backup_file="${BACKUP_DIR}/${timestamp}-config-before-routing.json.bak"
     cp "$CONFIG_PATH" "$backup_file" && echo -e "${GREEN}✓ Бэкап: $backup_file${NC}"
 
-    local tmp_config=$(mktemp)
+    local tmp_config=$(mktemp --suffix=.json)
     if jq --argjson routing "$routing_obj" '.routing = $routing' "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
         # === ДОБАВКА: тест конфига перед применением ===
         local test_output
