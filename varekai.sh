@@ -2750,7 +2750,7 @@ show_menu() {
     echo -e "${BRIGHT_RED}14. ${CYAN}Выдать ключ vless://${NC}"
     echo -e "${BRIGHT_RED}15. ${CYAN}Выдать Mihomo proxy${NC}"    
     echo -e "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-"
-    echo -e "${BRIGHT_RED}15. ${CYAN}Быстрый перезапуск Xray${NC}"
+    echo -e "${BRIGHT_RED}16. ${CYAN}Быстрый перезапуск Xray${NC}"
     echo -e "${BRIGHT_RED}0. ${CYAN}Выход${NC}"
     echo
 }
