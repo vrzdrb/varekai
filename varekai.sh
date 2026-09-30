@@ -1320,8 +1320,11 @@ setup_tcp_brutal() {
         echo -e "${GREEN}✓ Бэкап создан: $backup_file${NC}"
 
         # Проверка конфига ДО применения
-        if ! $XRAY_BIN run -test -config "$tmp_config" > /dev/null 2>&1; then
+        local test_output
+        if ! test_output=$($XRAY_BIN run -test -config "$tmp_config" 2>&1); then
             echo -e "${RED}Новый конфиг не прошёл проверку xray! Изменения отменены.${NC}"
+            echo -e "${YELLOW}Причина:${NC}"
+            echo "$test_output" | tail -n 15
             rm -f "$tmp_config"
             return 1
         fi
@@ -1410,8 +1413,11 @@ update_routing() {
     local tmp_config=$(mktemp)
     if jq --argjson routing "$routing_obj" '.routing = $routing' "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
         # === ДОБАВКА: тест конфига перед применением ===
-        if ! $XRAY_BIN run -test -config "$tmp_config" > /dev/null 2>&1; then
+        local test_output
+        if ! test_output=$($XRAY_BIN run -test -config "$tmp_config" 2>&1); then
             echo -e "${RED}Новый конфиг не прошёл проверку xray! Изменения отменены.${NC}"
+            echo -e "${YELLOW}Причина:${NC}"
+            echo "$test_output" | tail -n 15
             rm -f "$tmp_config" "$tmp_file"
             return 1
         fi
