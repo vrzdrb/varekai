@@ -875,7 +875,7 @@ generate_config() {
       "sniffing": null
     },
     {
-      "tag": "VLESS-Vision-REALITY",
+      "tag": "VLESS-SMUX-REALITY",
       "listen": "0.0.0.0",
       "port": 443,
       "protocol": "vless",
