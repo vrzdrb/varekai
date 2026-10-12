@@ -20,6 +20,7 @@ readonly USERS_LIST="/usr/local/etc/xray/users.list"
 readonly DAT_PATH="/usr/local/share/xray"
 readonly XRAY_BIN="/usr/local/bin/xray"
 readonly API_SERVER="127.0.0.1:32768"
+readonly STATS_DIR="/usr/local/etc/xray"
 
 # --- Цвета ---
 readonly RED='\033[31m'
@@ -75,6 +76,10 @@ load_env_config() {
     if [[ -f "$ENV_CONFIG_PATH" ]]; then
         source "$ENV_CONFIG_PATH"
     fi
+    # Значения по умолчанию для настроек ротации
+    LOG_ROTATE_ENABLED="${LOG_ROTATE_ENABLED:-true}"
+    LOG_ROTATE_TIME="${LOG_ROTATE_TIME:-06:00}"
+    LOG_ROTATE_KEEP="${LOG_ROTATE_KEEP:-30}"
 }
 
 # --- Сохранение переменных окружения ---
@@ -85,6 +90,9 @@ ROUTING_URL="${ROUTING_URL:-}"
 DOMAIN="${DOMAIN:-}"
 EDITOR="${EDITOR:-}"
 EDITOR_CONFIGURED="${EDITOR_CONFIGURED:-false}"
+LOG_ROTATE_ENABLED="${LOG_ROTATE_ENABLED:-true}"
+LOG_ROTATE_TIME="${LOG_ROTATE_TIME:-06:00}"
+LOG_ROTATE_KEEP="${LOG_ROTATE_KEEP:-30}"
 EOF
     chmod 644 "$ENV_CONFIG_PATH"
 }
@@ -319,8 +327,9 @@ install_xray() {
 
     rm -rf "$tmp_dir"
 
-    setup_logrotate
     setup_logs
+    setup_log_rotation
+    setup_stats_collection
 
     echo -e "${YELLOW}Введите домен для serverNames (например, example.com):${NC}"
     read -p "Домен: " domain
@@ -537,6 +546,10 @@ update_xray() {
         echo -e "${CYAN}Новая версия: ${GREEN}${new_version}${NC}"
         echo -e "${CYAN}Бэкап старого бинарника: ${YELLOW}${backup_bin}${NC}"
         log_message "Xray обновлён с $current_version до $new_version"
+
+        # Восстанавливаем сервисы обслуживания (ротация + статистика)
+        setup_log_rotation
+        setup_stats_collection
     else
         echo -e "${RED}Ошибка запуска Xray с новым бинарником!${NC}"
         echo -e "${YELLOW}Восстановление из бэкапа...${NC}"
@@ -548,20 +561,331 @@ update_xray() {
     fi
 }
 
-# --- Настройка logrotate ---
-setup_logrotate() {
-    cat > /etc/logrotate.d/xray << EOF
-/var/log/xray/*.log {
-    daily
-    missingok
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    create 0600 root root
-}
+# =============================================================================
+# Ротация логов
+# =============================================================================
+# Принцип: copytruncate. Xray открывает лог с O_APPEND, поэтому после
+# копирования access.log в access-YYYY-MM-DD.log и обрезки оригинала
+# запись продолжается в свежий access.log без перезапуска.
+# error.log никогда не ротируется.
+
+# --- Запись systemd timer-файла ротации (из LOG_ROTATE_TIME) ---
+write_logrotate_timer_file() {
+    local t="${LOG_ROTATE_TIME:-06:00}"
+    local hh="06" mm="00"
+    if [[ "$t" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+        hh="${BASH_REMATCH[1]}"
+        mm="${BASH_REMATCH[2]}"
+    fi
+    hh=$((10#$hh))
+    mm=$((10#$mm))
+    if (( hh > 23 || mm > 59 )); then
+        hh=6
+        mm=0
+    fi
+    printf -v hh "%02d" "$hh"
+
+    cat > /etc/systemd/system/xray-logrotate.timer << EOF
+[Unit]
+Description=Daily Xray access.log rotation
+
+[Timer]
+OnCalendar=*-*-* ${hh}:${mm}:00
+Persistent=true
+Unit=xray-logrotate.service
+
+[Install]
+WantedBy=timers.target
 EOF
-    log_message "Logrotate настроен"
+    chmod 644 /etc/systemd/system/xray-logrotate.timer
+}
+
+# --- Установка/восстановление ротации логов (идемпотентно) ---
+setup_log_rotation() {
+    # Удаляем легаси-конфиг logrotate: он ломает ротацию xray (rename+create)
+    # и ротирует error.log, который ротировать не нужно
+    rm -f /etc/logrotate.d/xray
+
+    # Скрипт ротации
+    cat > /usr/local/bin/xray-rotate-logs.sh << 'ROTATE_EOF'
+#!/usr/bin/env bash
+# =============================================================================
+# Ротация /var/log/xray/access.log
+# copytruncate: копия в access-YYYY-MM-DD.log + обрезка оригинала.
+# Безопасно, т.к. Xray открывает лог с O_APPEND (запись продолжится с нуля).
+# error.log никогда не ротируется.
+# =============================================================================
+set -u
+
+readonly ENV_CONFIG_PATH="/usr/local/etc/xray/xray-env.conf"
+readonly LOG_DIR="/var/log/xray"
+readonly ACCESS_LOG="${LOG_DIR}/access.log"
+
+# Переменная может быть задана извне (ручной запуск из меню при выключенной
+# автоматической ротации) — тогда env-файл не подменяет её
+if [[ -z "${LOG_ROTATE_ENABLED+x}" ]]; then
+    [[ -f "$ENV_CONFIG_PATH" ]] && source "$ENV_CONFIG_PATH"
+fi
+
+if [[ "${LOG_ROTATE_ENABLED:-true}" != "true" ]]; then
+    exit 0
+fi
+
+keep="${LOG_ROTATE_KEEP:-30}"
+[[ "$keep" =~ ^[0-9]+$ ]] || keep=30
+(( keep < 1 )) && keep=30
+
+today=$(date +%Y-%m-%d)
+archive="${LOG_DIR}/access-${today}.log"
+
+# Один архив в день: повторный запуск не портит данные
+if [[ -s "$ACCESS_LOG" && ! -f "$archive" ]]; then
+    cp "$ACCESS_LOG" "$archive"
+    chmod 600 "$archive"
+    truncate -s 0 "$ACCESS_LOG"
+    chmod 600 "$ACCESS_LOG"
+fi
+
+# Чистка старых архивов
+ls -1 "${LOG_DIR}"/access-????-??-??.log 2>/dev/null | sort | head -n "-${keep}" | xargs -r rm -f
+
+exit 0
+ROTATE_EOF
+    chmod 755 /usr/local/bin/xray-rotate-logs.sh
+
+    # Systemd units
+    cat > /etc/systemd/system/xray-logrotate.service << EOF
+[Unit]
+Description=Xray access.log rotation
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xray-rotate-logs.sh
+EOF
+    chmod 644 /etc/systemd/system/xray-logrotate.service
+
+    write_logrotate_timer_file
+
+    systemctl daemon-reload
+    if [[ "${LOG_ROTATE_ENABLED:-true}" == "true" ]]; then
+        systemctl enable --now xray-logrotate.timer > /dev/null 2>&1
+    fi
+    log_message "Ротация логов настроена"
+}
+
+# =============================================================================
+# Накопитель статистики трафика
+# =============================================================================
+# Снимает xray api statsquery каждые 10 минут, складывает дельты посуточно
+# в скрытый .traffic-days.json (с учётом сброса счётчиков при перезапуске)
+# и перегенерирует stats-YYYY-MM-DD.txt — человекочитаемую сводку
+# за скользящее окно 30 дней.
+
+setup_stats_collection() {
+    cat > /usr/local/bin/xray-stats-collect.sh << 'STATS_EOF'
+#!/usr/bin/env bash
+# =============================================================================
+# Накопитель статистики трафика Xray
+# Служебные данные: /usr/local/etc/xray/.traffic-days.json
+# Пользовательский вывод: /usr/local/etc/xray/stats-YYYY-MM-DD.txt
+# =============================================================================
+set -u
+
+readonly API_SERVER="127.0.0.1:32768"
+readonly XRAY_BIN="/usr/local/bin/xray"
+readonly CONFIG_PATH="/usr/local/etc/xray/config.json"
+readonly DATA_DIR="/usr/local/etc/xray"
+readonly DAYS_FILE="${DATA_DIR}/.traffic-days.json"
+readonly TXT_KEEP=30
+
+command -v jq > /dev/null 2>&1 || exit 0
+[[ -x "$XRAY_BIN" ]] || exit 0
+systemctl is-active --quiet xray 2>/dev/null || exit 0
+
+today=$(date +%Y-%m-%d)
+window_start=$(date -d "29 days ago" +%Y-%m-%d)
+
+raw=$("$XRAY_BIN" api statsquery --server="$API_SERVER" 2>/dev/null)
+[[ -z "$raw" ]] && exit 0
+echo "$raw" | jq empty > /dev/null 2>&1 || exit 0
+
+# --- Сырьё: агрегируем по пользователям / inbound / outbound ---
+extract() {
+    local prefix="$1"
+    echo "$raw" | jq --arg prefix "$prefix" '
+        [.stat[] | select(.name | startswith($prefix)) | (.name | split(">>>")) as $p
+            | {key: $p[1], dir: $p[3], val: .value}]
+        | group_by(.key)
+        | map({(.[0].key): {
+            up: (map(select(.dir == "uplink")) | .[0].val // 0),
+            down: (map(select(.dir == "downlink")) | .[0].val // 0)}})
+        | add // {}'
+}
+
+cur_users=$(extract "user>>>")
+cur_inbounds=$(extract "inbound>>>")
+cur_outbounds=$(extract "outbound>>>")
+
+# --- Слияние с посуточным хранилищем ---
+prev=""
+if [[ -f "$DAYS_FILE" ]]; then
+    prev=$(cat "$DAYS_FILE" 2>/dev/null)
+fi
+[[ -z "$prev" ]] && prev='{"last_raw":{"users":{},"inbounds":{},"outbounds":{}},"days":{}}'
+echo "$prev" | jq empty > /dev/null 2>&1 || prev='{"last_raw":{"users":{},"inbounds":{},"outbounds":{}},"days":{}}'
+
+merged=$(jq -n \
+    --argjson cu "$cur_users" --argjson ci "$cur_inbounds" --argjson co "$cur_outbounds" \
+    --argjson prev "$prev" --arg today "$today" --arg cut "$window_start" '
+    def delta(c; l): ((c // 0) - (l // 0)) as $d | if $d < 0 then (c // 0) else $d end;
+    def mergec($cur; $last; $rec):
+        reduce ($cur | to_entries[]) as $e ({};
+            .[$e.key] = {
+                up: (($rec[$e.key].up // 0) + delta($e.value.up; $last[$e.key].up)),
+                down: (($rec[$e.key].down // 0) + delta($e.value.down; $last[$e.key].down))
+            });
+    ($prev.last_raw.users // {}) as $lu |
+    ($prev.last_raw.inbounds // {}) as $li |
+    ($prev.last_raw.outbounds // {}) as $lo |
+    ($prev.days[$today] // {}) as $td |
+    {
+        last_raw: {users: $cu, inbounds: $ci, outbounds: $co},
+        days: (($prev.days // {}) + {($today): {
+            users: mergec($cu; $lu; ($td.users // {})),
+            inbounds: mergec($ci; $li; ($td.inbounds // {})),
+            outbounds: mergec($co; $lo; ($td.outbounds // {}))
+        }} | with_entries(select(.key >= $cut)))
+    }')
+
+tmp=$(mktemp)
+if echo "$merged" | jq . > "$tmp" 2>/dev/null; then
+    chmod 600 "$tmp"
+    mv "$tmp" "$DAYS_FILE"
+else
+    rm -f "$tmp"
+    exit 0
+fi
+
+# --- Генерация txt (окно 30 дней, все пользователи) ---
+SEP="═══════════════════════════════════"
+
+format_bytes() {
+    local bytes="${1:-0}"
+    if [[ -z "$bytes" || "$bytes" == "null" ]]; then bytes=0; fi
+    if (( bytes == 0 )); then
+        echo "0 B"
+    else
+        numfmt --to=iec-i --suffix=B "$bytes" 2>/dev/null || echo "${bytes} B"
+    fi
+}
+
+agg=$(echo "$merged" | jq --arg cut "$window_start" '
+    def sumobjs: reduce .[] as $x ({};
+        reduce ($x | to_entries[]) as $e (.;
+            .[$e.key] = {
+                up: ((.[$e.key].up // 0) + $e.value.up),
+                down: ((.[$e.key].down // 0) + $e.value.down)
+            }));
+    ([.days | to_entries[] | select(.key >= $cut) | .value] | {
+        users: ([.[].users] | sumobjs),
+        inbounds: ([.[].inbounds] | sumobjs),
+        outbounds: ([.[].outbounds] | sumobjs)
+    })')
+
+emails_now=""
+if [[ -f "$CONFIG_PATH" ]]; then
+    emails_now=$(jq -r '[.inbounds[]? | .settings.clients[]? | .email // empty] | unique | .[]' "$CONFIG_PATH" 2>/dev/null)
+fi
+
+stats_txt="${DATA_DIR}/stats-${today}.txt"
+tmp_txt=$(mktemp)
+
+{
+    echo "=== Статистика сервера ${window_start} : ${today} ==="
+    echo "$SEP"
+    echo "  Трафик по inbound'ам"
+    echo "$SEP"
+    echo "$agg" | jq -r '.inbounds | to_entries | map(.value += {total: (.value.up + .value.down)}) | sort_by(.value.total) | reverse | .[] | "\(.key)\t\(.value.up)\t\(.value.down)"' | while IFS=$'\t' read -r name up down; do
+        [[ -z "$name" ]] && continue
+        echo "  ${name}"
+        echo "    ↑ Upload: $(format_bytes "$up")"
+        echo "    ↓ Download: $(format_bytes "$down")"
+    done
+    echo "$SEP"
+    echo "  Трафик по outbound'ам"
+    echo "$SEP"
+    echo "$agg" | jq -r '.outbounds | to_entries | map(.value += {total: (.value.up + .value.down)}) | sort_by(.value.total) | reverse | .[] | "\(.key)\t\(.value.up)\t\(.value.down)"' | while IFS=$'\t' read -r name up down; do
+        [[ -z "$name" ]] && continue
+        echo "  ${name}"
+        echo "    ↑ Upload: $(format_bytes "$up")"
+        echo "    ↓ Download: $(format_bytes "$down")"
+    done
+    echo "$SEP"
+    echo "  Статистика по пользователям"
+    echo "$SEP"
+    total_users=0
+    rank=1
+    while IFS=$'\t' read -r email up down total; do
+        [[ -z "$email" ]] && continue
+        mark=""
+        if ! echo "$emails_now" | grep -qx "$email"; then
+            mark=" (удалён)"
+        fi
+        echo "  ${rank}. ${email}${mark}"
+        echo "     ↑ $(format_bytes "$up") | ↓ $(format_bytes "$down") | Σ $(format_bytes "$total")"
+        rank=$((rank + 1))
+        total_users=$((total_users + 1))
+    done < <(echo "$agg" | jq -r '.users | to_entries | map(.value += {total: (.value.up + .value.down)}) | sort_by(.value.total) | reverse | .[] | select(.value.total > 0) | "\(.key)\t\(.value.up)\t\(.value.down)\t\(.value.total)"')
+    echo
+    echo "  Всего пользователей с трафиком: ${total_users}"
+    echo "$SEP"
+    echo "  Итоговый трафик сервера"
+    echo "$SEP"
+    tot_in=$(echo "$agg" | jq '[.inbounds[].up, .inbounds[].down] | add // 0')
+    tot_out=$(echo "$agg" | jq '[.outbounds[].up, .outbounds[].down] | add // 0')
+    tot_usr=$(echo "$agg" | jq '[.users[].up, .users[].down] | add // 0')
+    echo "  Всего inbound:   $(format_bytes "$tot_in")"
+    echo "  Всего outbound:  $(format_bytes "$tot_out")"
+    echo "  Всего по users:  $(format_bytes "$tot_usr")"
+} > "$tmp_txt" 2>/dev/null
+
+chmod 644 "$tmp_txt" 2>/dev/null
+mv "$tmp_txt" "$stats_txt"
+
+# Храним txt-файлы 30 дней
+ls -1 "${DATA_DIR}"/stats-????-??-??.txt 2>/dev/null | sort | head -n "-${TXT_KEEP}" | xargs -r rm -f
+
+exit 0
+STATS_EOF
+    chmod 755 /usr/local/bin/xray-stats-collect.sh
+
+    cat > /etc/systemd/system/xray-stats.service << EOF
+[Unit]
+Description=Xray traffic stats collector
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xray-stats-collect.sh
+EOF
+    chmod 644 /etc/systemd/system/xray-stats.service
+
+    cat > /etc/systemd/system/xray-stats.timer << 'EOF'
+[Unit]
+Description=Xray traffic stats collector timer
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+Unit=xray-stats.service
+
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 644 /etc/systemd/system/xray-stats.timer
+
+    systemctl daemon-reload
+    systemctl enable --now xray-stats.timer > /dev/null 2>&1
+    log_message "Сбор статистики настроен"
 }
 
 # --- Настройка директории и файлов логов ---
@@ -985,11 +1309,11 @@ setup_tcp_brutal() {
             if bash <(curl -fsSL https://tcp.hy2.sh/); then
                 # Загрузка модуля
                 modprobe brutal 2>/dev/null || true
-    
+
                 # Включение Brutal как алгоритма по умолчанию
                 sysctl -w net.ipv4.tcp_congestion_control=brutal > /dev/null 2>&1
                 sysctl -w net.core.default_qdisc=fq > /dev/null 2>&1
-    
+
                 # === ПРОВЕРКА: модуль реально активен ===
                 local actual_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
                 if [[ "$actual_cc" != "brutal" ]]; then
@@ -1001,7 +1325,7 @@ setup_tcp_brutal() {
 
                 # Автозагрузка модуля при старте системы
                 echo "brutal" > /etc/modules-load.d/brutal.conf
-    
+
                 # Сохранение в sysctl.conf для персистентности
                 if ! grep -q "tcp_congestion_control=brutal" /etc/sysctl.conf; then
                     echo "net.ipv4.tcp_congestion_control=brutal" >> /etc/sysctl.conf
@@ -1056,8 +1380,6 @@ setup_tcp_brutal() {
         echo -e "${YELLOW}Запись brutal в config.json отменена — иначе inbound перестанет принимать соединения.${NC}"
         return 1
     fi
-
-    # Шаг 2: Проверка и настройка в config.json
 
     # Шаг 2: Проверка и настройка в config.json
     if [[ ! -f "$CONFIG_PATH" ]]; then
@@ -1153,7 +1475,7 @@ setup_tcp_brutal() {
         if jq --arg tag "$tag" \
               --arg enabled "$enabled" \
               --arg up "$up_speed" \
-              --arg down "$down_speed" 
+              --arg down "$down_speed" \
             '.inbounds |= map(
                 if .tag == $tag then
                     .smux = (.smux // {}) |
@@ -1217,6 +1539,12 @@ restart_xray_status() {
         echo -e "${RED}Сервис Xray не установлен. Сначала установите Xray.${NC}"
         return 1
     fi
+
+    # Принудительное снятие статистики ДО перезапуска, чтобы не потерять трафик
+    if [[ -x /usr/local/bin/xray-stats-collect.sh ]]; then
+        /usr/local/bin/xray-stats-collect.sh > /dev/null 2>&1
+    fi
+
     echo -e "${YELLOW}Перезапуск Xray...${NC}"
     if systemctl restart xray; then
         echo -e "${GREEN}✓ Xray перезапущен. Ожидание 3 секунд...${NC}"
@@ -1261,7 +1589,7 @@ update_routing() {
         routing_obj=$(jq '.' "$tmp_file")
     fi
 
-    # === КЛЮЧЕВАЯ ДОБАВКА: проверка структуры ===
+    # Проверка структуры
     if ! echo "$routing_obj" | jq -e 'type == "object" and (.rules | type == "array")' > /dev/null 2>&1; then
         echo -e "${RED}Скачанный файл не похож на routing: нет объекта с массивом rules.${NC}"
         echo -e "${YELLOW}Первые 200 байт ответа:${NC}"
@@ -1276,7 +1604,7 @@ update_routing() {
 
     local tmp_config=$(mktemp --suffix=.json)
     if jq --argjson routing "$routing_obj" '.routing = $routing' "$CONFIG_PATH" > "$tmp_config" 2>/dev/null; then
-        # === ДОБАВКА: тест конфига перед применением ===
+        # Тест конфига перед применением
         local test_output
         if ! test_output=$($XRAY_BIN run -test -config "$tmp_config" 2>&1); then
             echo -e "${RED}Новый конфиг не прошёл проверку xray! Изменения отменены.${NC}"
@@ -1331,13 +1659,16 @@ ROUTING_URL=""
 DOMAIN=""
 EDITOR=""
 EDITOR_CONFIGURED="false"
+LOG_ROTATE_ENABLED="true"
+LOG_ROTATE_TIME="06:00"
+LOG_ROTATE_KEEP="30"
 EOF
         chmod 644 "$ENV_CONFIG_PATH"
         echo -e "${GREEN}✓ Файл создан${NC}"
         echo
     fi
 
-    # КЛЮЧЕВАЯ ПРОВЕРКА: был ли редактор выбран через наше меню?
+    # Проверка: был ли редактор выбран через наше меню?
     if [[ "$EDITOR_CONFIGURED" != "true" ]]; then
         echo -e "${YELLOW}Текстовый редактор не настроен. Выберите редактор:${NC}"
         echo -e "${CYAN}1. nano${NC}"
@@ -1360,7 +1691,6 @@ EOF
                 ;;
         esac
 
-        # Помечаем, что редактор выбран через меню
         EDITOR_CONFIGURED="true"
         save_env_config
 
@@ -1528,7 +1858,7 @@ batch_add_users() {
         return 0
     fi
 
-    # Фильтрация пустых строк (схлопывание пробелов)
+    # Фильтрация пустых значений
     local users=()
     for u in $emails_input; do
         if [[ -n "$u" ]]; then
@@ -1588,7 +1918,6 @@ batch_add_users() {
     for email in "${users[@]}"; do
         local uuid=$(generate_uuid)
 
-        # Сохраняем для красивого вывода
         added_report+=("${email} --- ${uuid}")
 
         clients_array=$(echo "$clients_array" | jq --arg e "$email" --arg u "$uuid" --arg f "$flow_value" \
@@ -1709,7 +2038,6 @@ batch_remove_users() {
         done
 
         if [[ "$valid" == "true" && ${#chosen_indices[@]} -gt 0 ]]; then
-            # Убираем дубликаты номеров
             local unique_indices=($(echo "${chosen_indices[@]}" | tr ' ' '\n' | awk '!seen[$0]++'))
             for idx in "${unique_indices[@]}"; do
                 selected_tags+=("${tags[$((idx-1))]}")
@@ -1837,6 +2165,158 @@ batch_remove_users() {
     fi
 }
 
+# --- Выбор файла access.log (текущий + ротированные) ---
+CHOSEN_LOG=""
+choose_access_log() {
+    CHOSEN_LOG=""
+    local files=()
+    [[ -f /var/log/xray/access.log ]] && files+=("/var/log/xray/access.log")
+    while IFS= read -r f; do
+        files+=("$f")
+    done < <(ls -1 /var/log/xray/access-????-??-??.log 2>/dev/null | sort -r)
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo -e "${YELLOW}Файлы access.log не найдены${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Доступные файлы логов:${NC}"
+    local i=1
+    local f base
+    for f in "${files[@]}"; do
+        base=$(basename "$f")
+        if [[ "$base" == "access.log" ]]; then
+            echo -e "${CYAN}${i}. ${base} (текущий)${NC}"
+        else
+            echo -e "${CYAN}${i}. ${base}${NC}"
+        fi
+        ((i++))
+    done
+
+    local choice
+    read -p "Выберите файл [1-${#files[@]}]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le ${#files[@]} ]]; then
+        CHOSEN_LOG="${files[$((choice-1))]}"
+        return 0
+    fi
+    echo -e "${RED}Неверный выбор${NC}"
+    return 1
+}
+
+# --- Строки пользователя из access.log ---
+# Современный формат Xray: "... from IP:port accepted tcp:domain:443 [inbound-tag] email: user@x"
+# Легаси-формат: "... IP:port accepted tcp:domain:443 [user@x]"
+grep_user_lines() {
+    local email="$1" file="$2" out="$3"
+    grep -F -- "email: ${email}" "$file" 2>/dev/null > "$out"
+    if [[ ! -s "$out" ]]; then
+        grep -F -- "${email}]" "$file" 2>/dev/null > "$out"
+    fi
+    if [[ ! -s "$out" ]]; then
+        grep -F -- "$email" "$file" 2>/dev/null > "$out"
+    fi
+}
+
+# --- Статистика пользователя по времени ---
+user_stats_by_time() {
+    local email="$1"
+    choose_access_log || return 0
+
+    echo -e "${YELLOW}Укажите период:${NC}"
+    echo -e "${YELLOW}  - дата, с которой вывести записи (YYYY-MM-DD)${NC}"
+    echo -e "${YELLOW}  - количество последних дней (число)${NC}"
+    echo -e "${YELLOW}  - Enter: весь файл${NC}"
+    read -p "Период: " period
+
+    local since=""
+    if [[ "$period" =~ ^[0-9]+$ ]]; then
+        since=$(date -d "${period} days ago" +%Y/%m/%d 2>/dev/null)
+    elif [[ "$period" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        since="${period//-//}"
+    elif [[ -n "$period" ]]; then
+        echo -e "${RED}Не распознан формат периода — будет показан весь файл${NC}"
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    grep_user_lines "$email" "$CHOSEN_LOG" "$tmp"
+    if [[ -n "$since" ]]; then
+        awk -v s="$since" 'substr($1,1,10) >= s' "$tmp" > "${tmp}.f" && mv "${tmp}.f" "$tmp"
+    fi
+
+    local count
+    count=$(wc -l < "$tmp")
+    echo -e "${YELLOW}Файл: $(basename "$CHOSEN_LOG") | записей: ${count}${NC}"
+    if [[ -n "$since" ]]; then
+        echo -e "${YELLOW}Период: с ${since//\//-}${NC}"
+    fi
+    if (( count == 0 )); then
+        local total_lines
+        total_lines=$(wc -l < "$CHOSEN_LOG" 2>/dev/null || echo 0)
+        if [[ "$total_lines" =~ ^[0-9]+$ ]] && (( total_lines == 0 )); then
+            echo -e "${RED}Файл пуст.${NC}"
+            echo -e "${YELLOW}Проверьте, что в config.json задан log.access и Xray перезапущен после изменений.${NC}"
+        else
+            echo -e "${YELLOW}Записей для ${email} не найдено (всего строк в файле: ${total_lines}).${NC}"
+            echo -e "${YELLOW}Последние строки файла для сверки формата:${NC}"
+            tail -n 3 "$CHOSEN_LOG"
+        fi
+    else
+        echo -e "${YELLOW}═══════════════════════════${NC}"
+        cat "$tmp"
+    fi
+    rm -f "$tmp"
+}
+
+# --- Статистика пользователя по доменам ---
+user_stats_by_domain() {
+    local email="$1"
+    choose_access_log || return 0
+
+    read -p "Сколько последних уникальных доменов вывести (0-1000, 0 = все) [100]: " dom_count
+    dom_count=${dom_count:-100}
+    if [[ ! "$dom_count" =~ ^[0-9]+$ ]] || (( dom_count < 0 || dom_count > 1000 )); then
+        echo -e "${RED}Неверное значение (нужно число 0-1000)${NC}"
+        return 1
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    grep_user_lines "$email" "$CHOSEN_LOG" "$tmp"
+
+    local domains
+    domains=$(awk '{for (i = 1; i <= NF; i++) if ($i ~ /^(tcp|udp):/) { d = $i; sub(/^(tcp|udp):/, "", d); sub(/:[0-9]+$/, "", d); if (d ~ /^[0-9.]+$/ || index(d, ":") > 0) next; print d; break } }' "$tmp" | \
+        tac | awk '!seen[$0]++')
+    rm -f "$tmp"
+
+    if (( dom_count > 0 )); then
+        domains=$(echo "$domains" | head -n "$dom_count")
+    fi
+
+    local total
+    total=$(printf '%s\n' "$domains" | sed '/^$/d' | wc -l)
+
+    if (( total == 0 )); then
+        local total_lines
+        total_lines=$(wc -l < "$CHOSEN_LOG" 2>/dev/null || echo 0)
+        if [[ "$total_lines" =~ ^[0-9]+$ ]] && (( total_lines == 0 )); then
+            echo -e "${RED}Файл пуст.${NC}"
+            echo -e "${YELLOW}Проверьте, что в config.json задан log.access и Xray перезапущен после изменений.${NC}"
+        else
+            echo -e "${YELLOW}Доменов для ${email} не найдено (всего строк в файле: ${total_lines}).${NC}"
+            echo -e "${YELLOW}Последние строки файла для сверки формата:${NC}"
+            tail -n 3 "$CHOSEN_LOG"
+        fi
+        return 0
+    fi
+
+    echo -e "${YELLOW}Последние домены для ${email} (уникальных: ${total}):${NC}"
+    echo -e "${YELLOW}═══════════════════════════${NC}"
+    printf '%s\n' "$domains" | while IFS= read -r d; do
+        [[ -n "$d" ]] && echo -e "  ${GREEN}• ${d}${NC}"
+    done
+}
+
 # --- Статистика пользователя ---
 user_stats() {
     echo -e "${CYAN}=== Статистика пользователя ===${NC}"
@@ -1880,17 +2360,22 @@ user_stats() {
     echo -e "${CYAN}UUID:  ${GREEN}${uuid}${NC}"
     echo
 
+    local access_path
+    access_path=$(jq -r '.log.access // empty' "$CONFIG_PATH" 2>/dev/null)
+    if [[ -z "$access_path" ]]; then
+        echo -e "${RED}Внимание: в config.json не задан log.access — access.log не пишется,${NC}"
+        echo -e "${RED}статистика по логам будет пустой.${NC}"
+        echo
+    fi
+
     # Получение статистики через API
     echo -e "${CYAN}Получение статистики трафика...${NC}"
 
-    # Xray api возвращает объект с полем "stat", содержащим массив
     local stats_raw=$(xray api statsquery --server="$API_SERVER" 2>/dev/null)
 
     if [[ -z "$stats_raw" ]]; then
         echo -e "${YELLOW}Не удалось получить статистику (Xray может быть не запущен или API недоступен)${NC}"
     else
-        # Фильтруем статистику по email пользователя
-        # Формат имени: user>>>email>>>traffic>>>uplink / user>>>email>>>traffic>>>downlink
         local user_stats=$(echo "$stats_raw" | jq -r --arg email "$email" '
             .stat[] |
             select(.name | contains($email)) |
@@ -1907,7 +2392,6 @@ user_stats() {
         if [[ -n "$user_stats" ]]; then
             echo -e "${YELLOW}Статистика трафика для ${email}:${NC}"
             echo "$user_stats" | while IFS= read -r line; do
-                # Конвертация байтов в человекочитаемый формат
                 if [[ "$line" =~ ^[↑↓] ]]; then
                     local bytes=$(echo "$line" | grep -oE '[0-9]+')
                     local direction=$(echo "$line" | cut -d: -f1)
@@ -1922,7 +2406,6 @@ user_stats() {
                 fi
             done
 
-            # Итоговая сумма
             local total=$(echo "$stats_raw" | jq -r --arg email "$email" '
                 [.stat[] | select(.name | contains($email)) | .value] | add // 0
             ' 2>/dev/null)
@@ -1939,88 +2422,18 @@ user_stats() {
 
     echo
 
-    # Поиск IP-адресов в логах
-    echo -e "${CYAN}Поиск IP-адресов в access.log...${NC}"
-
-    # Собираем все файлы логов (обычные и сжатые)
-    local log_files=()
-    [[ -f /var/log/xray/access.log ]] && log_files+=(/var/log/xray/access.log)
-    [[ -f /var/log/xray/access.log.1 ]] && log_files+=(/var/log/xray/access.log.1)
-    [[ -f /var/log/xray/access.log.2.gz ]] && log_files+=(/var/log/xray/access.log.2.gz)
-    [[ -f /var/log/xray/access.log.3.gz ]] && log_files+=(/var/log/xray/access.log.3.gz)
-    # Добавим все доступные .gz файлы
-    for gz in /var/log/xray/access.log.*.gz; do
-        [[ -f "$gz" ]] && log_files+=("$gz")
-    done
-
-    if [[ ${#log_files[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}Файлы логов не найдены${NC}"
-        return 0
-    fi
-
-    # Определяем период по датам файлов
-    local oldest_date=""
-    local newest_date=""
-
-    for log_file in "${log_files[@]}"; do
-        if [[ -f "$log_file" ]]; then
-            local file_date=$(stat -c %y "$log_file" 2>/dev/null | cut -d' ' -f1)
-            if [[ -n "$file_date" ]]; then
-                if [[ -z "$oldest_date" ]] || [[ "$file_date" < "$oldest_date" ]]; then
-                    oldest_date="$file_date"
-                fi
-                if [[ -z "$newest_date" ]] || [[ "$file_date" > "$newest_date" ]]; then
-                    newest_date="$file_date"
-                fi
-            fi
-        fi
-    done
-
-    # Временный файл для объединённых логов
-    local tmp_logs=$(mktemp)
-
-    # Собираем содержимое всех логов в один файл
-    for log_file in "${log_files[@]}"; do
-        if [[ "$log_file" == *.gz ]]; then
-            zcat "$log_file" 2>/dev/null >> "$tmp_logs"
-        else
-            cat "$log_file" 2>/dev/null >> "$tmp_logs"
-        fi
-    done
-
-    # Поиск строк с email (или UUID) и извлечение IP
-    # Формат access.log: "2024/01/01 14:10:15 1.2.3.4:54321 accepted tcp:example.com:443 [email]"
-    # IP находится в 3-м поле (после даты и времени)
-    local ips=$(grep -E "$email|$uuid" "$tmp_logs" 2>/dev/null | \
-        awk '{print $3}' | \
-        cut -d: -f1 | \
-        grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$|^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$' | \
-        sort -u)
-
-    rm -f "$tmp_logs"
-
-    if [[ -n "$ips" ]]; then
-        local ip_count=$(echo "$ips" | wc -l)
-        echo -e "${YELLOW}Найдено уникальных IP-адресов: ${GREEN}${ip_count}${NC}"
-        echo -e "${YELLOW}Список IP:${NC}"
-        echo "$ips" | while IFS= read -r ip; do
-            if [[ -n "$ip" ]]; then
-                echo -e "  ${GREEN}• ${ip}${NC}"
-            fi
-        done
-    else
-        echo -e "${YELLOW}IP-адреса не найдены в логах${NC}"
-        echo -e "${YELLOW}Возможно, пользователь ещё не подключался или логи были ротированы${NC}"
-    fi
-
-    echo
-    if [[ -n "$oldest_date" && -n "$newest_date" ]]; then
-        if [[ "$oldest_date" == "$newest_date" ]]; then
-            echo -e "${CYAN}Период логов: ${GREEN}${oldest_date}${NC}"
-        else
-            echo -e "${CYAN}Период логов: ${GREEN}${oldest_date}${CYAN} — ${GREEN}${newest_date}${NC}"
-        fi
-    fi
+    # Статистика по access.log
+    echo -e "${CYAN}Статистика по access.log:${NC}"
+    echo -e "${CYAN}1. По времени${NC}"
+    echo -e "${CYAN}2. По доменам${NC}"
+    echo -e "${CYAN}0. Назад${NC}"
+    read -p "Выбор [0-2]: " log_choice
+    case "$log_choice" in
+        1) user_stats_by_time "$email" ;;
+        2) user_stats_by_domain "$email" ;;
+        0) return 0 ;;
+        *) echo -e "${RED}Неверный выбор${NC}" ;;
+    esac
 }
 
 # --- Статистика сервера ---
@@ -2053,7 +2466,6 @@ server_stats() {
     echo -e "${CYAN}Получение общей статистики...${NC}"
     echo
 
-    # Получение всех статистик
     local all_stats=$(xray api statsquery --server="$API_SERVER" 2>/dev/null)
 
     if [[ -z "$all_stats" ]]; then
@@ -2062,7 +2474,6 @@ server_stats() {
         return 1
     fi
 
-    # Проверка наличия поля stat
     local has_stat=$(echo "$all_stats" | jq 'has("stat")' 2>/dev/null)
     if [[ "$has_stat" != "true" ]]; then
         echo -e "${YELLOW}Статистика пуста или API не вернул данные${NC}"
@@ -2070,7 +2481,6 @@ server_stats() {
         return 0
     fi
 
-    # Вспомогательная функция для конвертации байтов
     format_bytes() {
         local bytes=$1
         if [[ -z "$bytes" || "$bytes" == "null" || "$bytes" == "0" ]]; then
@@ -2166,10 +2576,9 @@ server_stats() {
 
     echo
     echo -e "${YELLOW}═══════════════════════════════════${NC}"
-    echo -e "${YELLOW}  Top-10 пользователей по трафику${NC}"
+    echo -e "${YELLOW}  Top-30 пользователей по трафику${NC}"
     echo -e "${YELLOW}═══════════════════════════════════${NC}"
 
-    # Извлечение статистики пользователей
     local user_stats=$(echo "$all_stats" | jq -r '
         .stat[] |
         select(.name | test("^user>>>")) |
@@ -2179,7 +2588,6 @@ server_stats() {
     ' 2>/dev/null)
 
     if [[ -n "$user_stats" ]]; then
-        # Группировка по пользователям и подсчёт общего трафика
         local top_users=$(echo "$user_stats" | jq -rs '
             group_by(.user) |
             .[] |
@@ -2189,7 +2597,7 @@ server_stats() {
                 down: (map(select(.direction == "downlink")) | .[0].bytes // 0),
                 total: ((map(.bytes) | add) // 0)
             }
-        ' 2>/dev/null | jq -s 'sort_by(.total) | reverse | .[0:10]')
+        ' 2>/dev/null | jq -s 'sort_by(.total) | reverse | .[0:30]')
 
         local rank=1
         echo "$top_users" | jq -c '.[]' 2>/dev/null | while IFS= read -r user_json; do
@@ -2207,7 +2615,6 @@ server_stats() {
             ((rank++))
         done
 
-        # Подсчёт общего числа пользователей
         local total_users=$(echo "$user_stats" | jq -rs '[.[].user] | unique | length' 2>/dev/null)
         echo
         echo -e "  ${YELLOW}Всего пользователей с трафиком: ${GREEN}${total_users}${NC}"
@@ -2221,17 +2628,14 @@ server_stats() {
     echo -e "${YELLOW}  Итоговый трафик сервера${NC}"
     echo -e "${YELLOW}═══════════════════════════════════${NC}"
 
-    # Общий трафик всех inbound'ов
     local total_inbound=$(echo "$all_stats" | jq -r '
         [.stat[] | select(.name | test("^inbound>>>")) | .value] | add // 0
     ' 2>/dev/null)
 
-    # Общий трафик всех outbound'ов
     local total_outbound=$(echo "$all_stats" | jq -r '
         [.stat[] | select(.name | test("^outbound>>>")) | .value] | add // 0
     ' 2>/dev/null)
 
-    # Общий трафик всех пользователей
     local total_users_traffic=$(echo "$all_stats" | jq -r '
         [.stat[] | select(.name | test("^user>>>")) | .value] | add // 0
     ' 2>/dev/null)
@@ -2244,364 +2648,423 @@ server_stats() {
     echo -e "  ${CYAN}Всего outbound:  ${GREEN}${total_outbound_h}${NC}"
     echo -e "  ${CYAN}Всего по users:  ${GREEN}${total_users_h}${NC}"
     echo
-    echo -e "  ${YELLOW}Примечание: статистика сбрасывается при перезапуске Xray${NC}"
+    echo -e "  ${YELLOW}Примечание: статистика выше сбрасывается при перезапуске Xray${NC}"
+    echo -e "  ${YELLOW}Накопленная статистика (последние 30 дней) хранится в:${NC}"
+    echo -e "  ${CYAN}${STATS_DIR}/stats-$(date +%Y-%m-%d).txt${NC}"
+
+    echo
+    read -p "Показать накопленную статистику за последние 30 дней? [y/N]: " acc_choice
+    if [[ "$acc_choice" =~ ^[Yy]$ ]]; then
+        local stats_file="${STATS_DIR}/stats-$(date +%Y-%m-%d).txt"
+        if [[ ! -f "$stats_file" && -x /usr/local/bin/xray-stats-collect.sh ]]; then
+            /usr/local/bin/xray-stats-collect.sh
+        fi
+        echo
+        if [[ -f "$stats_file" ]]; then
+            cat "$stats_file"
+        else
+            echo -e "${YELLOW}Накопленных данных пока нет${NC}"
+        fi
+    fi
 }
 
-# --- Генерация VLESS ссылок ---
+# --- Генерация VLESS-ссылок ---
 generate_vless_links() {
-    echo -e "${CYAN}=== Генерация VLESS ссылок ===${NC}"
+    echo -e "${CYAN}=== Генерация VLESS-ссылок ===${NC}"
+
     if [[ ! -f "$CONFIG_PATH" ]]; then
         echo -e "${RED}Конфиг не найден${NC}"
         return 1
     fi
 
-    local vless_inbounds_json
-    vless_inbounds_json=$(jq -c '.inbounds[] | select(.protocol == "vless")' "$CONFIG_PATH" 2>/dev/null)
-
-    if [[ -z "$vless_inbounds_json" ]]; then
-        echo -e "${YELLOW}VLESS-inbounds не найдены${NC}"
-        return 0
-    fi
-
-    local inbounds=()
-    local tags=()
-    local has_untagged=false
-
-    while IFS= read -r inb; do
-        local tag=$(echo "$inb" | jq -r '.tag // empty')
-        if [[ -z "$tag" ]]; then
-            has_untagged=true
-            continue
-        fi
-        inbounds+=("$inb")
-        tags+=("$tag")
-    done <<< "$vless_inbounds_json"
-
-    if [[ "$has_untagged" == "true" ]]; then
-        echo -e "${YELLOW}⚠ Найден VLESS-inbound без tag, он пропущен${NC}"
-    fi
-
-    if [[ ${#tags[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}Нет доступных VLESS-inbounds с тегами${NC}"
-        return 0
-    fi
-
-    echo -e "${CYAN}Доступные VLESS-inbounds:${NC}"
-    for i in "${!tags[@]}"; do
-        echo -e "${CYAN}$((i+1)). ${tags[$i]}${NC}"
-    done
-    echo -e "${CYAN}0. Выход в главное меню${NC}"
-
-    local choice
-    while true; do
-        read -p "Выберите inbound [1-${#tags[@]}] или 0 для выхода: " choice
-        if [[ "$choice" == "0" ]]; then
-            echo -e "${YELLOW}Операция отменена${NC}"
-            return 0
-        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#tags[@]}" ]]; then
-            break
-        else
-            echo -e "${RED}Неверный ввод, повторите попытку${NC}"
-        fi
-    done
-
-    local selected_idx=$((choice-1))
-    local selected_tag="${tags[$selected_idx]}"
-    local selected_inb="${inbounds[$selected_idx]}"
-
-    echo -e "${YELLOW}Получение IP сервера...${NC}"
-    local server_ip=$(curl -s -4 ifconfig.me || curl -s -4 api.ipify.org)
-    if [[ -z "$server_ip" ]]; then
-        echo -e "${RED}Не удалось получить IP${NC}"
-        return 1
-    fi
-    echo -e "${GREEN}IP сервера: $server_ip${NC}"
-
-    local port=$(echo "$selected_inb" | jq -r '.port // "443"')
-    local network=$(echo "$selected_inb" | jq -r '.streamSettings.network // "tcp"')
-    local security=$(echo "$selected_inb" | jq -r '.streamSettings.security // "none"')
-
-    echo -e "${YELLOW}Выберите fingerprint:${NC}"
-    echo -e "${CYAN}1. chrome${NC}"
-    echo -e "${CYAN}2. firefox${NC}"
-    echo -e "${CYAN}3. safari${NC}"
-    echo -e "${CYAN}4. edge${NC}"
-    echo -e "${CYAN}5. random${NC}"
-    read -p "Выбор [1-5] (Enter для random): " fp_choice
-    local fp="random"
-    case "$fp_choice" in
-        1) fp="chrome" ;;
-        2) fp="firefox" ;;
-        3) fp="safari" ;;
-        4) fp="edge" ;;
-        5) fp="random" ;;
-    esac
-
-    echo -e "${YELLOW}Введите email'ы или UUID'ы клиентов через пробел (0 для выхода):${NC}"
-    read -p "Значения: " -r users_input
-    if [[ "$users_input" == "0" ]]; then
-        echo -e "${YELLOW}Операция отменена${NC}"
-        return 0
-    fi
-
-    local search_values=()
-    for v in $users_input; do
-        if [[ -n "$v" ]]; then
-            search_values+=("$v")
-        fi
-    done
-
-    if [[ ${#search_values[@]} -eq 0 ]]; then
-        echo -e "${RED}Не введено ни одного значения${NC}"
+    read -p "Введите IP или домен сервера: " server_address
+    if [[ -z "$server_address" ]]; then
+        echo -e "${RED}Адрес сервера не указан${NC}"
         return 1
     fi
 
-    for value in "${search_values[@]}"; do
-        local client_json=""
-        local is_uuid=false
+    local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    local links_file="${BACKUP_DIR}/vless-links-${timestamp}.txt"
+    local total_links=0
 
-        if [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            is_uuid=true
-            client_json=$(echo "$selected_inb" | jq -c --arg uuid "$value" '.settings.clients[]? | select(.id == $uuid)' 2>/dev/null | head -n 1)
-        else
-            client_json=$(echo "$selected_inb" | jq -c --arg email "$value" '.settings.clients[]? | select(.email == $email)' 2>/dev/null | head -n 1)
-        fi
+    # Получение всех VLESS-inbounds с их клиентами
+    local inbounds_json=$(jq -c '.inbounds[] | select(.protocol == "vless")' "$CONFIG_PATH" 2>/dev/null)
 
-        if [[ -z "$client_json" ]]; then
-            echo -e "${RED}⚠ Пользователь $value не найден в $selected_tag${NC}"
-            continue
-        fi
+    if [[ -z "$inbounds_json" ]]; then
+        echo -e "${YELLOW}VLESS-inbounds не найдены в конфиге${NC}"
+        return 0
+    fi
 
-        local uuid=$(echo "$client_json" | jq -r '.id // empty')
-        local email=$(echo "$client_json" | jq -r '.email // empty')
-        local flow=$(echo "$client_json" | jq -r '.flow // empty')
+    echo
+    echo -e "${YELLOW}Генерация ссылок...${NC}"
+    echo
 
-        if [[ -z "$uuid" ]]; then
-            echo -e "${RED}Не удалось получить UUID для $value${NC}"
-            continue
-        fi
+    while IFS= read -r inbound; do
+        local tag=$(echo "$inbound" | jq -r '.tag // "unnamed"')
+        local port=$(echo "$inbound" | jq -r '.port')
+        local network=$(echo "$inbound" | jq -r '.streamSettings.network // "tcp"')
+        local security=$(echo "$inbound" | jq -r '.streamSettings.security // "none"')
 
-        local display_name="${email:-$uuid}"
+        local public_key=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.publicKey // empty')
+        local short_id=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.shortIds[0] // empty')
+        local server_name=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.serverNames[0] // empty')
+        local sni=$(echo "$inbound" | jq -r '.streamSettings.tlsSettings.serverName // empty')
+        local fp=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.fingerprint // "chrome"')
 
-        # Сборка параметров ссылки
-        local link_params="type=${network}&security=${security}"
-
-        if [[ "$security" == "reality" ]]; then
-            local sni=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.serverNames[0] // empty')
-            local private_key=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.privateKey // empty')
-            local short_id=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.shortIds[0] // empty')
-
-            if [[ -z "$sni" || -z "$private_key" ]]; then
-                echo -e "${RED}Ошибка: не найдены параметры Reality для $selected_tag${NC}"
-                continue
-            fi
-
-            local public_key=$($XRAY_BIN x25519 -i "$private_key" 2>/dev/null | awk -F': ' 'NR==2 {print $2}')
-            if [[ -z "$public_key" ]]; then
-                echo -e "${RED}Не удалось получить public key для $selected_tag${NC}"
-                continue
-            fi
-
-            link_params+="&sni=${sni}&fp=${fp}&pbk=${public_key}"
-            [[ -n "$short_id" ]] && link_params+="&sid=${short_id}"
+        if [[ "$security" == "reality" && -n "$public_key" ]]; then
+            echo -e "${CYAN}═══ Inbound: ${tag} (Reality) ═══${NC}" | tee -a "$links_file"
         elif [[ "$security" == "tls" ]]; then
-            local sni=$(echo "$selected_inb" | jq -r '.streamSettings.tlsSettings.serverName // empty')
-            [[ -n "$sni" ]] && link_params+="&sni=${sni}&fp=${fp}"
+            echo -e "${CYAN}═══ Inbound: ${tag} (TLS) ═══${NC}" | tee -a "$links_file"
+        else
+            echo -e "${CYAN}═══ Inbound: ${tag} ═══${NC}" | tee -a "$links_file"
         fi
 
-        if [[ "$network" == "ws" ]]; then
-            local path=$(echo "$selected_inb" | jq -r '.streamSettings.wsSettings.path // "/"')
-            local host=$(echo "$selected_inb" | jq -r '.streamSettings.wsSettings.headers.Host // empty')
-            link_params+="&path=$(printf %s "$path" | jq -sRr @uri)"
-            [[ -n "$host" ]] && link_params+="&host=$(printf %s "$host" | jq -sRr @uri)"
-        elif [[ "$network" == "grpc" ]]; then
-            local serviceName=$(echo "$selected_inb" | jq -r '.streamSettings.grpcSettings.serviceName // empty')
-            [[ -n "$serviceName" ]] && link_params+="&serviceName=${serviceName}"
-        elif [[ "$network" == "httpupgrade" ]]; then
-            local path=$(echo "$selected_inb" | jq -r '.streamSettings.httpupgradeSettings.path // "/"')
-            local host=$(echo "$selected_inb" | jq -r '.streamSettings.httpupgradeSettings.host // empty')
-            link_params+="&path=$(printf %s "$path" | jq -sRr @uri)"
-            [[ -n "$host" ]] && link_params+="&host=$(printf %s "$host" | jq -sRr @uri)"
-        fi
+        local clients=$(echo "$inbound" | jq -c '.settings.clients[]?' 2>/dev/null)
+        local link_count=0
 
-        local link="vless://${uuid}@${server_ip}:${port}?${link_params}"
-        if [[ -n "$flow" ]]; then
-            link+="&flow=${flow}"
-        fi
-        # URL-кодирование имени в хэше ссылки
-        link+="#$(printf %s "$display_name" | jq -sRr @uri)"
+        while IFS= read -r client; do
+            local uuid=$(echo "$client" | jq -r '.id')
+            local email=$(echo "$client" | jq -r '.email // "unnamed"')
+            local flow=$(echo "$client" | jq -r '.flow // ""')
 
-        echo -e "${CYAN}Ссылка для $display_name:${NC}"
-        echo -e "${GREEN}${link}${NC}"
+            local vless_link=""
+
+            if [[ "$security" == "reality" ]]; then
+                vless_link="vless://${uuid}@${server_address}:${port}?type=${network}&security=reality&pbk=${public_key}&fp=${fp}&sni=${server_name}&sid=${short_id}"
+                if [[ -n "$flow" ]]; then
+                    vless_link="${vless_link}&flow=${flow}"
+                fi
+            elif [[ "$security" == "tls" ]]; then
+                vless_link="vless://${uuid}@${server_address}:${port}?type=${network}&security=tls&sni=${sni}&fp=${fp}"
+                if [[ -n "$flow" ]]; then
+                    vless_link="${vless_link}&flow=${flow}"
+                fi
+            else
+                vless_link="vless://${uuid}@${server_address}:${port}?type=${network}&security=none"
+            fi
+
+            vless_link="${vless_link}#${email}"
+
+            echo -e "${GREEN}${email}:${NC}"
+            echo -e "${CYAN}${vless_link}${NC}"
+            echo
+
+            echo "${email}:" >> "$links_file"
+            echo "${vless_link}" >> "$links_file"
+            echo >> "$links_file"
+
+            ((link_count++))
+            ((total_links++))
+        done <<< "$clients"
+
+        echo -e "${YELLOW}Сгенерировано ссылок для ${tag}: ${link_count}${NC}"
         echo
-    done
+    done <<< "$inbounds_json"
+
+    echo -e "${GREEN}═══════════════════════════════════${NC}"
+    echo -e "${GREEN}✓ Итого сгенерировано ссылок: ${total_links}${NC}"
+    echo -e "${YELLOW}Ссылки сохранены в: ${links_file}${NC}"
 }
 
 # --- Генерация Mihomo proxy ---
 generate_mihomo_proxies() {
     echo -e "${CYAN}=== Генерация Mihomo proxy ===${NC}"
+
     if [[ ! -f "$CONFIG_PATH" ]]; then
         echo -e "${RED}Конфиг не найден${NC}"
         return 1
     fi
 
-    local vless_inbounds_json
-    vless_inbounds_json=$(jq -c '.inbounds[] | select(.protocol == "vless")' "$CONFIG_PATH" 2>/dev/null)
-
-    if [[ -z "$vless_inbounds_json" ]]; then
-        echo -e "${YELLOW}VLESS-inbounds не найдены${NC}"
-        return 0
-    fi
-
-    local inbounds=()
-    local tags=()
-    local has_untagged=false
-
-    while IFS= read -r inb; do
-        local tag=$(echo "$inb" | jq -r '.tag // empty')
-        if [[ -z "$tag" ]]; then
-            has_untagged=true
-            continue
-        fi
-        inbounds+=("$inb")
-        tags+=("$tag")
-    done <<< "$vless_inbounds_json"
-
-    if [[ "$has_untagged" == "true" ]]; then
-        echo -e "${YELLOW}⚠ Найден VLESS-inbound без tag, он пропущен${NC}"
-    fi
-
-    if [[ ${#tags[@]} -eq 0 ]]; then
-        echo -e "${YELLOW}Нет доступных VLESS-inbounds с тегами${NC}"
-        return 0
-    fi
-
-    echo -e "${CYAN}Доступные VLESS-inbounds:${NC}"
-    for i in "${!tags[@]}"; do
-        echo -e "${CYAN}$((i+1)). ${tags[$i]}${NC}"
-    done
-    echo -e "${CYAN}0. Выход в главное меню${NC}"
-
-    local choice
-    while true; do
-        read -p "Выберите inbound [1-${#tags[@]}] или 0 для выхода: " choice
-        if [[ "$choice" == "0" ]]; then
-            echo -e "${YELLOW}Операция отменена${NC}"
-            return 0
-        elif [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "${#tags[@]}" ]]; then
-            break
-        else
-            echo -e "${RED}Неверный ввод, повторите попытку${NC}"
-        fi
-    done
-
-    local selected_idx=$((choice-1))
-    local selected_tag="${tags[$selected_idx]}"
-    local selected_inb="${inbounds[$selected_idx]}"
-
-    echo -e "${YELLOW}Получение IP сервера...${NC}"
-    local server_ip=$(curl -s -4 ifconfig.me || curl -s -4 api.ipify.org)
-    if [[ -z "$server_ip" ]]; then
-        echo -e "${RED}Не удалось получить IP${NC}"
+    read -p "Введите IP или домен сервера: " server_address
+    if [[ -z "$server_address" ]]; then
+        echo -e "${RED}Адрес сервера не указан${NC}"
         return 1
     fi
-    echo -e "${GREEN}IP сервера: $server_ip${NC}"
 
-    local security=$(echo "$selected_inb" | jq -r '.streamSettings.security // "none"')
+    local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    local proxy_file="${BACKUP_DIR}/mihomo-proxies-${timestamp}.yaml"
+    local total_proxies=0
 
-    # Параметры security одинаковы для всех пользователей — получаем один раз
-    local sni="" public_key="" short_id=""
-    if [[ "$security" == "reality" ]]; then
-        sni=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.serverNames[0] // empty')
-        local private_key=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.privateKey // empty')
-        short_id=$(echo "$selected_inb" | jq -r '.streamSettings.realitySettings.shortIds[0] // empty')
+    # Получение всех VLESS-inbounds
+    local inbounds_json=$(jq -c '.inbounds[] | select(.protocol == "vless")' "$CONFIG_PATH" 2>/dev/null)
 
-        if [[ -z "$sni" || -z "$private_key" ]]; then
-            echo -e "${RED}Ошибка: не найдены параметры Reality для $selected_tag${NC}"
-            return 1
-        fi
-
-        public_key=$($XRAY_BIN x25519 -i "$private_key" 2>/dev/null | awk -F': ' 'NR==2 {print $2}')
-        if [[ -z "$public_key" ]]; then
-            echo -e "${RED}Не удалось получить public key для $selected_tag${NC}"
-            return 1
-        fi
-    elif [[ "$security" == "tls" ]]; then
-        sni=$(echo "$selected_inb" | jq -r '.streamSettings.tlsSettings.serverName // empty')
-    fi
-
-    echo -e "${YELLOW}Введите email'ы или UUID'ы клиентов через пробел (0 для выхода):${NC}"
-    read -p "Значения: " -r users_input
-    if [[ "$users_input" == "0" ]]; then
-        echo -e "${YELLOW}Операция отменена${NC}"
+    if [[ -z "$inbounds_json" ]]; then
+        echo -e "${YELLOW}VLESS-inbounds не найдены в конфиге${NC}"
         return 0
-    fi
-
-    local search_values=()
-    for v in $users_input; do
-        if [[ -n "$v" ]]; then
-            search_values+=("$v")
-        fi
-    done
-
-    if [[ ${#search_values[@]} -eq 0 ]]; then
-        echo -e "${RED}Не введено ни одного значения${NC}"
-        return 1
     fi
 
     echo
-    echo -e "${YELLOW}proxies:${NC}"
+    echo -e "${YELLOW}Генерация Mihomo proxy...${NC}"
+    echo
 
-    for value in "${search_values[@]}"; do
-        local client_json=""
+    echo "proxies:" > "$proxy_file"
 
-        if [[ "$value" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            client_json=$(echo "$selected_inb" | jq -c --arg uuid "$value" '.settings.clients[]? | select(.id == $uuid)' 2>/dev/null | head -n 1)
+    while IFS= read -r inbound; do
+        local tag=$(echo "$inbound" | jq -r '.tag // "unnamed"')
+        local port=$(echo "$inbound" | jq -r '.port')
+        local network=$(echo "$inbound" | jq -r '.streamSettings.network // "tcp"')
+        local security=$(echo "$inbound" | jq -r '.streamSettings.security // "none"')
+
+        local public_key=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.publicKey // empty')
+        local short_id=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.shortIds[0] // empty')
+        local server_name=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.serverNames[0] // empty')
+        local sni=$(echo "$inbound" | jq -r '.streamSettings.tlsSettings.serverName // empty')
+        local fp=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.fingerprint // "chrome"')
+
+        local clients=$(echo "$inbound" | jq -c '.settings.clients[]?' 2>/dev/null)
+        local proxy_count=0
+
+        while IFS= read -r client; do
+            local uuid=$(echo "$client" | jq -r '.id')
+            local email=$(echo "$client" | jq -r '.email // "unnamed"')
+            local flow=$(echo "$client" | jq -r '.flow // ""')
+
+            # Уникальное имя прокси
+            local proxy_name="${email} | ${server_address}:${port}"
+
+            {
+                echo "  - name: \"${proxy_name}\""
+                echo "    type: vless"
+                echo "    server: ${server_address}"
+                echo "    port: ${port}"
+                echo "    uuid: ${uuid}"
+                echo "    network: ${network}"
+            } >> "$proxy_file"
+
+            if [[ "$security" == "reality" ]]; then
+                {
+                    echo "    tls: true"
+                    echo "    servername: ${server_name}"
+                    echo "    reality-opts:"
+                    echo "      public-key: ${public_key}"
+                    echo "      short-id: ${short_id}"
+                } >> "$proxy_file"
+            elif [[ "$security" == "tls" ]]; then
+                {
+                    echo "    tls: true"
+                    echo "    servername: ${sni}"
+                } >> "$proxy_file"
+            fi
+
+            {
+                echo "    client-fingerprint: ${fp}"
+                echo "    udp: true"
+            } >> "$proxy_file"
+
+            if [[ -n "$flow" ]]; then
+                echo "    flow: ${flow}" >> "$proxy_file"
+            fi
+
+            echo >> "$proxy_file"
+
+            ((proxy_count++))
+            ((total_proxies++))
+        done <<< "$clients"
+
+        echo -e "${YELLOW}Сгенерировано proxy для ${tag}: ${proxy_count}${NC}"
+    done <<< "$inbounds_json"
+
+    echo
+    echo -e "${GREEN}═══════════════════════════════════${NC}"
+    echo -e "${GREEN}✓ Итого сгенерировано proxy: ${total_proxies}${NC}"
+    echo -e "${YELLOW}Файл сохранён в: ${proxy_file}${NC}"
+    echo
+    echo -e "${CYAN}Добавьте этот файл в ваш Mihomo конфиг через proxy-providers:${NC}"
+    echo -e "${YELLOW}proxy-providers:${NC}"
+    echo -e "${YELLOW}  my-proxies:${NC}"
+    echo -e "${YELLOW}    type: file${NC}"
+    echo -e "${YELLOW}    path: ./mihomo-proxies.yaml${NC}"
+    echo -e "${YELLOW}    health-check:${NC}"
+    echo -e "${YELLOW}      enable: true${NC}"
+    echo -e "${YELLOW}      url: https://www.gstatic.com/generate_204${NC}"
+    echo -e "${YELLOW}      interval: 300${NC}"
+}
+
+# =============================================================================
+# Пункт 16. Меню ротации логов
+# =============================================================================
+log_rotation_menu() {
+    while true; do
+        echo -e "${CYAN}=== Ротация логов ===${NC}"
+
+        local enabled="${LOG_ROTATE_ENABLED:-true}"
+        if [[ "$enabled" == "true" ]]; then
+            echo -e "  Ротация: ${GREEN}включена${NC}"
         else
-            client_json=$(echo "$selected_inb" | jq -c --arg email "$value" '.settings.clients[]? | select(.email == $email)' 2>/dev/null | head -n 1)
+            echo -e "  Ротация: ${RED}выключена${NC}"
         fi
+        echo -e "  Время ротации: ${CYAN}${LOG_ROTATE_TIME:-06:00}${NC}"
+        echo -e "  Хранить архивов: ${CYAN}${LOG_ROTATE_KEEP:-30}${NC}"
 
-        if [[ -z "$client_json" ]]; then
-            echo -e "${RED}⚠ Пользователь $value не найден в $selected_tag${NC}" >&2
-            continue
-        fi
+        local timer_enabled timer_active next_run
+        timer_enabled=$(systemctl is-enabled xray-logrotate.timer 2>/dev/null)
+        timer_active=$(systemctl is-active xray-logrotate.timer 2>/dev/null)
+        echo -e "  Systemd timer: ${YELLOW}${timer_enabled:-не установлен}/${timer_active:-—}${NC}"
 
-        local uuid=$(echo "$client_json" | jq -r '.id // empty')
-        local email=$(echo "$client_json" | jq -r '.email // empty')
+        next_run=$(systemctl list-timers xray-logrotate.timer --no-pager 2>/dev/null | awk '/xray-logrotate\.timer/{print $1" "$2}')
+        echo -e "  Следующий запуск: ${CYAN}${next_run:-—}${NC}"
 
-        if [[ -z "$uuid" ]]; then
-            echo -e "${RED}Не удалось получить UUID для $value${NC}" >&2
-            continue
-        fi
+        local arch_count arch_size
+        arch_count=$(ls -1 /var/log/xray/access-????-??-??.log 2>/dev/null | wc -l)
+        arch_size=$(du -ch /var/log/xray/access-????-??-??.log 2>/dev/null | tail -1 | cut -f1)
+        echo -e "  Архивов access-*.log: ${CYAN}${arch_count}${NC} (суммарно: ${CYAN}${arch_size:-0}${NC})"
+        echo -e "  ${YELLOW}error.log не ротируется никогда${NC}"
+        echo
+        echo -e "${CYAN}1. ${NC}Включить/выключить ротацию"
+        echo -e "${CYAN}2. ${NC}Изменить время ротации"
+        echo -e "${CYAN}3. ${NC}Изменить глубину хранения"
+        echo -e "${CYAN}4. ${NC}Ротировать сейчас"
+        echo -e "${CYAN}0. ${NC}Назад"
+        echo
 
-        local display_name="${email:-$uuid}"
-        local name_quoted=$(printf %s "$display_name" | jq -sRr @json)
+        local choice
+        read -p "Выбор [0-4]: " choice
 
-        echo "  - name: ${name_quoted}"
-        echo "    server: ${server_ip}"
-        echo "    uuid: ${uuid}"
-        if [[ -n "$sni" ]]; then
-            echo "    servername: ${sni}"
-        fi
-        if [[ "$security" == "reality" ]]; then
-            echo "    reality-opts:"
-            echo "      public-key: ${public_key}"
-            [[ -n "$short_id" ]] && echo "      short-id: ${short_id}"
-        fi
+        case "$choice" in
+            1)
+                if [[ "${LOG_ROTATE_ENABLED:-true}" == "true" ]]; then
+                    LOG_ROTATE_ENABLED="false"
+                    save_env_config
+                    systemctl disable --now xray-logrotate.timer > /dev/null 2>&1
+                    echo -e "${YELLOW}Ротация выключена${NC}"
+                else
+                    LOG_ROTATE_ENABLED="true"
+                    save_env_config
+                    write_logrotate_timer_file
+                    systemctl enable --now xray-logrotate.timer > /dev/null 2>&1
+                    echo -e "${GREEN}✓ Ротация включена${NC}"
+                fi
+                ;;
+            2)
+                read -p "Время ротации (HH:MM) [${LOG_ROTATE_TIME:-06:00}]: " new_time
+                new_time=${new_time:-${LOG_ROTATE_TIME:-06:00}}
+                if [[ ! "$new_time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+                    echo -e "${RED}Неверный формат времени (нужно HH:MM)${NC}"
+                else
+                    LOG_ROTATE_TIME="$new_time"
+                    save_env_config
+                    write_logrotate_timer_file
+                    systemctl restart xray-logrotate.timer > /dev/null 2>&1
+                    echo -e "${GREEN}✓ Время ротации: ${new_time}${NC}"
+                fi
+                ;;
+            3)
+                read -p "Сколько архивов хранить [${LOG_ROTATE_KEEP:-30}]: " new_keep
+                new_keep=${new_keep:-${LOG_ROTATE_KEEP:-30}}
+                if [[ ! "$new_keep" =~ ^[0-9]+$ ]] || (( new_keep < 1 )); then
+                    echo -e "${RED}Нужно положительное число${NC}"
+                else
+                    LOG_ROTATE_KEEP="$new_keep"
+                    save_env_config
+                    ls -1 /var/log/xray/access-????-??-??.log 2>/dev/null | sort | head -n "-${new_keep}" | xargs -r rm -f
+                    echo -e "${GREEN}✓ Глубина хранения: ${new_keep}${NC}"
+                fi
+                ;;
+            4)
+                if [[ -x /usr/local/bin/xray-rotate-logs.sh ]]; then
+                    /usr/local/bin/xray-rotate-logs.sh
+                    echo -e "${GREEN}✓ Ротация выполнена${NC}"
+                else
+                    echo -e "${RED}Скрипт ротации не найден${NC}"
+                fi
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                echo -e "${RED}Неверный выбор${NC}"
+                ;;
+        esac
+
+        echo
+        read -p "Нажмите Enter для продолжения..."
+        echo
     done
 }
 
-# --- Главное меню ---
+# --- Пункт 17. Просмотр access.log в реальном времени ---
+view_access_log() {
+    echo -e "${CYAN}=== Просмотр access.log (реальное время, последние 100 строк) ===${NC}"
+    if [[ ! -f /var/log/xray/access.log ]]; then
+        echo -e "${YELLOW}/var/log/xray/access.log не найден${NC}"
+        return 0
+    fi
+    echo -e "${YELLOW}Ctrl+C для выхода из просмотра${NC}"
+    tail -n 100 -f /var/log/xray/access.log
+}
+
+# --- Пункт 18. Поиск по access.log ---
+search_access_log() {
+    echo -e "${CYAN}=== Поиск по access.log ===${NC}"
+    choose_access_log || return 0
+
+    echo -e "${YELLOW}Что искать? Можно указать:${NC}"
+    echo -e "${YELLOW}  - дату или время (YYYY-MM-DD или YYYY/MM/DD HH:MM)${NC}"
+    echo -e "${YELLOW}  - домен (example.com)${NC}"
+    echo -e "${YELLOW}  - email пользователя${NC}"
+    echo -e "${YELLOW}  - любую часть строки${NC}"
+    read -p "Поисковый запрос: " pattern
+    if [[ -z "$pattern" ]]; then
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+
+    if [[ "$pattern" =~ ^[0-9]{4}[-/][0-9]{2}[-/][0-9]{2} ]]; then
+        # Дата/время — якорим к началу строки, приводим к формату лога
+        local p="${pattern:0:10}"
+        p="${p//-//}"
+        if [[ "$pattern" =~ ^[0-9]{4}[-/][0-9]{2}[-/][0-9]{2}[[:space:]]+([0-9]{2}:[0-9]{2}) ]]; then
+            p="${p} ${BASH_REMATCH[1]}"
+        fi
+        grep -- "^${p}" "$CHOSEN_LOG" 2>/dev/null > "$tmp"
+    else
+        grep -F -- "$pattern" "$CHOSEN_LOG" 2>/dev/null > "$tmp"
+    fi
+
+    local count
+    count=$(wc -l < "$tmp")
+    if (( count == 0 )); then
+        echo -e "${YELLOW}Совпадений не найдено${NC}"
+    else
+        echo -e "${YELLOW}Файл: $(basename "$CHOSEN_LOG") | совпадений: ${count}${NC}"
+        echo -e "${YELLOW}═══════════════════════════${NC}"
+        cat "$tmp"
+    fi
+    rm -f "$tmp"
+}
+
+# --- Пункт 19. Просмотр error.log ---
+view_error_log() {
+    echo -e "${CYAN}=== Просмотр error.log ===${NC}"
+    if [[ ! -f /var/log/xray/error.log ]]; then
+        echo -e "${YELLOW}/var/log/xray/error.log не найден${NC}"
+        return 0
+    fi
+
+    local editor="${EDITOR:-}"
+    if [[ -z "$editor" ]]; then
+        editor="nano"
+    fi
+    if ! command -v "$editor" > /dev/null 2>&1; then
+        echo -e "${YELLOW}Редактор '$editor' не найден. Устанавливаем nano...${NC}"
+        apt-get install -y nano > /dev/null 2>&1
+        editor="nano"
+    fi
+
+    echo -e "${CYAN}Открытие error.log в ${editor}...${NC}"
+    "$editor" /var/log/xray/error.log
+}
+
+# --- Меню ---
 show_menu() {
     clear
     show_banner
-
-    local xray_version=$(get_xray_version)
-    echo -e "${BRIGHT_RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${CYAN}Xray Version: ${GREEN}${xray_version}${NC}"
-    echo -e "${CYAN}Fork: ${GREEN}github.com/${XRAY_FORK_REPO}${NC}"
-    echo -e "${BRIGHT_RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "Текущая версия Xray: ${GREEN}$(get_xray_version)${NC}"
+    echo -e "Репозиторий: ${CYAN}https://github.com/${XRAY_FORK_REPO}${NC}"
     echo
+    echo -e "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-"
     echo -e "${BRIGHT_RED}1. ${CYAN}Установка Xray${NC}"
     echo -e "${BRIGHT_RED}2. ${CYAN}Обновление Xray${NC}"
     echo -e "${BRIGHT_RED}3. ${CYAN}Настройка TCP Brutal${NC}"
@@ -2618,48 +3081,65 @@ show_menu() {
     echo -e "${BRIGHT_RED}12. ${CYAN}Просмотр статистики пользователя${NC}"
     echo -e "${BRIGHT_RED}13. ${CYAN}Просмотр статистики сервера${NC}"
     echo -e "${BRIGHT_RED}14. ${CYAN}Выдать ключ vless://${NC}"
-    echo -e "${BRIGHT_RED}15. ${CYAN}Выдать Mihomo proxy${NC}"    
+    echo -e "${BRIGHT_RED}15. ${CYAN}Выдать Mihomo proxy${NC}"
     echo -e "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-"
-    echo -e "${BRIGHT_RED}16. ${CYAN}Быстрый перезапуск Xray${NC}"
+    echo -e "${BRIGHT_RED}16. ${CYAN}Ротация логов${NC}"
+    echo -e "${BRIGHT_RED}17. ${CYAN}Просмотр access.log${NC}"
+    echo -e "${BRIGHT_RED}18. ${CYAN}Поиск по access.log${NC}"
+    echo -e "${BRIGHT_RED}19. ${CYAN}Просмотр error.log${NC}"
+    echo -e "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-"
+    echo -e "${BRIGHT_RED}20. ${CYAN}Быстрый перезапуск Xray${NC}"
     echo -e "${BRIGHT_RED}0. ${CYAN}Выход${NC}"
     echo
 }
 
 # --- Основная функция ---
-# --- Основная функция ---
 main() {
     check_root
     create_directories
-    load_env_config
     check_dependencies
     detect_architecture
+    load_env_config
+
+    # Самовосстановление сервисов обслуживания (ротация + статистика),
+    # чтобы они появились и на серверах, где Xray установлен ранее
+    if [[ -f "$XRAY_BIN" ]]; then
+        setup_log_rotation
+        setup_stats_collection
+    fi
 
     while true; do
         show_menu
-        read -p "Выберите пункт меню [0-16]: " choice
 
-        case "$choice" in
-            1) install_xray ;;           # Установка Xray
-            2) update_xray ;;            # Обновление Xray
-            3) setup_tcp_brutal ;;       # Настройка TCP Brutal
-            4) install_warp ;;           # Установка WARP от xxphantom
-            5) open_config ;;            # Открыть config.json
-            6) update_routing ;;         # Обновление массива routing
-            7) change_routing_source ;;  # Смена источника обновлений routing
-            8) create_backup ;;          # Сделать бэкап config.json
-            9) restore_backup ;;         # Восстановить config.json из бэкапа
-            10) batch_add_users ;;       # Пакетное добавление пользователей
-            11) batch_remove_users ;;    # Пакетное удаление пользователей
-            12) user_stats ;;            # Просмотр статистики пользователя
-            13) server_stats ;;          # Просмотр статистики сервера
-            14) generate_vless_links ;;  # Выдать ключ vless://
-            15) generate_mihomo_proxies ;;   # Выдать Mihomo proxy
-            16) restart_xray_status ;;       # Быстрый перезапуск Xray
-	    0)
+        read -p "Выберите пункт меню [0-20]: " choice
+
+        case $choice in
+            1) install_xray ;;
+            2) update_xray ;;
+            3) setup_tcp_brutal ;;
+            4) install_warp ;;
+            5) open_config ;;
+            6) update_routing ;;
+            7) change_routing_source ;;
+            8) create_backup ;;
+            9) restore_backup ;;
+            10) batch_add_users ;;
+            11) batch_remove_users ;;
+            12) user_stats ;;
+            13) server_stats ;;
+            14) generate_vless_links ;;
+            15) generate_mihomo_proxies ;;
+            16) log_rotation_menu ;;
+            17) view_access_log ;;
+            18) search_access_log ;;
+            19) view_error_log ;;
+            20) restart_xray_status ;;
+            0)
+                echo -e "${YELLOW}Выход...${NC}"
                 exit 0
                 ;;
             *)
-                echo -e "${RED}Неверный выбор${NC}"
+                echo -e "${RED}Неверный выбор, попробуйте снова${NC}"
                 ;;
         esac
 
@@ -2668,7 +3148,5 @@ main() {
     done
 }
 
-# Запуск
 main "$@"
-
 
