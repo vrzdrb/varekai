@@ -841,11 +841,11 @@ tmp_txt=$(mktemp)
     echo "$SEP"
     echo "  Итоговый трафик сервера"
     echo "$SEP"
-    tot_in=$(echo "$agg" | jq '[.inbounds[].up, .inbounds[].down] | add // 0')
-    tot_out=$(echo "$agg" | jq '[.outbounds[].up, .outbounds[].down] | add // 0')
+    tot_down=$(echo "$agg" | jq '[.inbounds[].down] | add // 0')
+    tot_up=$(echo "$agg" | jq '[.inbounds[].up] | add // 0')
     tot_usr=$(echo "$agg" | jq '[.users[].up, .users[].down] | add // 0')
-    echo "  Всего inbound:   $(format_bytes "$tot_in")"
-    echo "  Всего outbound:  $(format_bytes "$tot_out")"
+    echo "  Всего download:  $(format_bytes "$tot_down")"
+    echo "  Всего upload:    $(format_bytes "$tot_up")"
     echo "  Всего по users:  $(format_bytes "$tot_usr")"
 } > "$tmp_txt" 2>/dev/null
 
@@ -2628,24 +2628,26 @@ server_stats() {
     echo -e "${YELLOW}  Итоговый трафик сервера${NC}"
     echo -e "${YELLOW}═══════════════════════════════════${NC}"
 
-    local total_inbound=$(echo "$all_stats" | jq -r '
-        [.stat[] | select(.name | test("^inbound>>>")) | .value] | add // 0
+    # inbound downlink = трафик к пользователям (download),
+    # inbound uplink = трафик от пользователей (upload)
+    local total_download=$(echo "$all_stats" | jq -r '
+        [.stat[] | select(.name | test("^inbound>>>")) | select(.name | test("downlink$")) | .value] | add // 0
     ' 2>/dev/null)
 
-    local total_outbound=$(echo "$all_stats" | jq -r '
-        [.stat[] | select(.name | test("^outbound>>>")) | .value] | add // 0
+    local total_upload=$(echo "$all_stats" | jq -r '
+        [.stat[] | select(.name | test("^inbound>>>")) | select(.name | test("uplink$")) | .value] | add // 0
     ' 2>/dev/null)
 
     local total_users_traffic=$(echo "$all_stats" | jq -r '
         [.stat[] | select(.name | test("^user>>>")) | .value] | add // 0
     ' 2>/dev/null)
 
-    local total_inbound_h=$(format_bytes "$total_inbound")
-    local total_outbound_h=$(format_bytes "$total_outbound")
+    local total_download_h=$(format_bytes "$total_download")
+    local total_upload_h=$(format_bytes "$total_upload")
     local total_users_h=$(format_bytes "$total_users_traffic")
 
-    echo -e "  ${CYAN}Всего inbound:   ${GREEN}${total_inbound_h}${NC}"
-    echo -e "  ${CYAN}Всего outbound:  ${GREEN}${total_outbound_h}${NC}"
+    echo -e "  ${CYAN}Всего download:  ${GREEN}${total_download_h}${NC}"
+    echo -e "  ${CYAN}Всего upload:    ${GREEN}${total_upload_h}${NC}"
     echo -e "  ${CYAN}Всего по users:  ${GREEN}${total_users_h}${NC}"
     echo
     echo -e "  ${YELLOW}Примечание: статистика выше сбрасывается при перезапуске Xray${NC}"
@@ -3149,4 +3151,3 @@ main() {
 }
 
 main "$@"
-
