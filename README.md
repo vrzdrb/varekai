@@ -14,6 +14,8 @@
 
 - Ядро: [Jolymmiles/Xray-core](https://github.com/Jolymmiles/Xray-core) c встроенной поддержкой mihomo-совместимого мультиплексирования **SMUX** и **H2MUX**
 - Удобное обновление ядра с выбором конкретной версии для установки
+- Интерактивный выбор inbound для установки: VLESS-SMUX-Reality / VLESS-SMUX-TLS
+- Интерактивный выбор listen port и target / dest для fallback
 - Установка модуля ядра Linux TCP Brutal
 - Автоматическая установка WARP от [xxphantom/docker-warp-native](https://github.com/xxphantom/docker-warp-native). при установке Xray
 - Возможность обновления правил серверного роутинга из удалённого источника по raw-ссылке
