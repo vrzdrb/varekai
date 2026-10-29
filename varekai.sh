@@ -22,6 +22,15 @@ readonly XRAY_BIN="/usr/local/bin/xray"
 readonly API_SERVER="127.0.0.1:32768"
 readonly STATS_DIR="/usr/local/etc/xray"
 
+# Параметры inbound VLESS (заполняются при установке)
+INBOUND_TYPE="reality"       # reality | tls
+INBOUND_LISTEN="0.0.0.0"
+INBOUND_PORT="443"
+FALLBACK_TARGET="127.0.0.1:7443"   # для REALITY (realitySettings.target)
+FALLBACK_PORT="7443"               # для TLS (fallbacks[].dest)
+TLS_SERVER_NAME=""
+TLS_CERT_DIR=""
+
 # --- Цвета ---
 readonly RED='\033[31m'
 readonly BRIGHT_RED='\033[1;31m'
@@ -331,10 +340,95 @@ install_xray() {
     setup_log_rotation
     setup_stats_collection
 
-    echo -e "${YELLOW}Введите домен для serverNames (например, example.com):${NC}"
-    read -p "Домен: " domain
-    DOMAIN="$domain"
-    save_env_config
+    echo -e "${CYAN}Выберите тип inbound'а:${NC}"
+    echo -e "${CYAN}1. VLESS-SMUX-REALITY${NC}"
+    echo -e "${CYAN}2. VLESS-SMUX-TLS${NC}"
+    while true; do
+        read -p "Выбор [1-2] [1]: " inbound_type_choice
+        inbound_type_choice=${inbound_type_choice:-1}
+        case "$inbound_type_choice" in
+            1)
+                INBOUND_TYPE="reality"
+                break
+                ;;
+            2)
+                INBOUND_TYPE="tls"
+                break
+                ;;
+            *)
+                echo -e "${RED}Неверный выбор, повторите${NC}"
+                ;;
+        esac
+    done
+
+    if [[ "$INBOUND_TYPE" == "reality" ]]; then
+        echo -e "${YELLOW}Введите домен для serverNames (например, example.com):${NC}"
+        read -p "Домен: " domain
+        DOMAIN="$domain"
+        save_env_config
+    fi
+
+    while true; do
+        read -p "Какой адрес:порт должен слушать xray? [0.0.0.0:443]: " listen_input
+        listen_input=${listen_input:-"0.0.0.0:443"}
+        if [[ "$listen_input" =~ ^[^:]+:[0-9]+$ ]]; then
+            INBOUND_LISTEN="${listen_input%:*}"
+            INBOUND_PORT="${listen_input##*:}"
+            break
+        else
+            echo -e "${RED}Неверный формат. Нужно IP:порт (например, 0.0.0.0:443)${NC}"
+        fi
+    done
+
+    if [[ "$INBOUND_TYPE" == "reality" ]]; then
+        while true; do
+            read -p "На какой адрес:порт будет fallback? [127.0.0.1:7443]: " fallback_input
+            fallback_input=${fallback_input:-"127.0.0.1:7443"}
+            if [[ "$fallback_input" =~ ^[^:]+:[0-9]+$ ]]; then
+                FALLBACK_TARGET="$fallback_input"
+                break
+            else
+                echo -e "${RED}Неверный формат. Нужно IP:порт (например, 127.0.0.1:7443)${NC}"
+            fi
+        done
+
+        echo -e "${CYAN}Xray будет слушать: ${GREEN}${INBOUND_LISTEN}:${INBOUND_PORT}${NC}"
+        echo -e "${CYAN}Fallback target:   ${GREEN}${FALLBACK_TARGET}${NC}"
+    else
+        while true; do
+            read -p "На какой порт будет fallback? [7443]: " fallback_port_input
+            fallback_port_input=${fallback_port_input:-7443}
+            if [[ "$fallback_port_input" =~ ^[0-9]+$ ]] && (( fallback_port_input >= 1 && fallback_port_input <= 65535 )); then
+                FALLBACK_PORT="$fallback_port_input"
+                break
+            else
+                echo -e "${RED}Неверный порт (нужно число 1-65535)${NC}"
+            fi
+        done
+
+        while [[ -z "${TLS_SERVER_NAME:-}" ]]; do
+            read -p "Домен для TLS serverName: " tls_server_name
+            if [[ -n "$tls_server_name" ]]; then
+                TLS_SERVER_NAME="$tls_server_name"
+            else
+                echo -e "${RED}Домен не может быть пустым${NC}"
+            fi
+        done
+
+        tls_cert_default="/etc/letsencrypt/live/${TLS_SERVER_NAME}"
+        read -p "Путь к директории сертификатов [${tls_cert_default}]: " tls_cert_dir
+        TLS_CERT_DIR="${tls_cert_dir:-$tls_cert_default}"
+
+        echo -e "${CYAN}Xray будет слушать: ${GREEN}${INBOUND_LISTEN}:${INBOUND_PORT}${NC}"
+        echo -e "${CYAN}Fallback dest:     ${GREEN}${FALLBACK_PORT}${NC}"
+        echo -e "${CYAN}TLS serverName:    ${GREEN}${TLS_SERVER_NAME}${NC}"
+        echo -e "${CYAN}Сертификаты:       ${GREEN}${TLS_CERT_DIR}/fullchain.pem${NC}"
+        echo -e "${CYAN}                   ${GREEN}${TLS_CERT_DIR}/privkey.pem${NC}"
+
+        if [[ ! -f "${TLS_CERT_DIR}/fullchain.pem" || ! -f "${TLS_CERT_DIR}/privkey.pem" ]]; then
+            echo -e "${YELLOW}Внимание: файлы сертификатов не найдены. Убедитесь, что они существуют до перезапуска Xray.${NC}"
+        fi
+    fi
 
     generate_config
     create_systemd_service
@@ -914,19 +1008,118 @@ setup_logs() {
 }
 
 # --- Генерация конфига Xray ---
-generate_config() {
-    echo -e "${CYAN}Генерация конфигурации Xray...${NC}"
-
-    local x25519_keys=$(generate_x25519)
-    local private_key=$(echo "$x25519_keys" | awk '{print $1}')
-    local public_key=$(echo "$x25519_keys" | awk '{print $2}')
-
+# --- Сборка VLESS-inbound'а по выбранному типу (reality | tls) ---
+build_vless_inbound() {
     local vision_uuid=$(generate_uuid)
 
-    local short_ids=$(generate_short_ids)
-    local short_id_1=$(echo "$short_ids" | awk '{print $1}')
-    local short_id_2=$(echo "$short_ids" | awk '{print $2}')
-    local short_id_3=$(echo "$short_ids" | awk '{print $3}')
+    if [[ "$INBOUND_TYPE" == "tls" ]]; then
+        cat << INBOUND_EOF
+    {
+      "tag": "VLESS-SMUX-TLS",
+      "listen": "${INBOUND_LISTEN}",
+      "port": ${INBOUND_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "email": "vless@xtls.reality",
+            "id": "$vision_uuid",
+            "flow": "",
+            "level": 0
+          }
+        ],
+        "decryption": "none",
+        "fallbacks": [
+          {
+            "dest": ${FALLBACK_PORT}
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "${TLS_SERVER_NAME}",
+          "alpn": ["http/1.1"],
+          "minVersion": "1.2",
+          "maxVersion": "1.3",
+          "certificates": [
+            {
+              "certificateFile": "${TLS_CERT_DIR}/fullchain.pem",
+              "keyFile": "${TLS_CERT_DIR}/privkey.pem"
+            }
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    }
+INBOUND_EOF
+    else
+        local x25519_keys=$(generate_x25519)
+        local private_key=$(echo "$x25519_keys" | awk '{print $1}')
+
+        local short_ids=$(generate_short_ids)
+        local short_id_1=$(echo "$short_ids" | awk '{print $1}')
+        local short_id_2=$(echo "$short_ids" | awk '{print $2}')
+        local short_id_3=$(echo "$short_ids" | awk '{print $3}')
+
+        cat << INBOUND_EOF
+    {
+      "tag": "VLESS-SMUX-REALITY",
+      "listen": "${INBOUND_LISTEN}",
+      "port": ${INBOUND_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "email": "vless@xtls.reality",
+            "id": "$vision_uuid",
+            "flow": "",
+            "level": 0
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "target": "${FALLBACK_TARGET}",
+          "xver": 0,
+          "serverNames": [
+            "$DOMAIN"
+          ],
+          "privateKey": "$private_key",
+          "shortIds": [
+            "$short_id_1",
+            "$short_id_2",
+            "$short_id_3"
+          ]
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      }
+    }
+INBOUND_EOF
+    fi
+}
+
+generate_config() {
+    echo -e "${CYAN}Генерация конфигурации Xray...${NC}"
 
     cat > "$CONFIG_PATH" << EOF
 {
@@ -1062,49 +1255,7 @@ generate_config() {
       },
       "sniffing": null
     },
-    {
-      "tag": "VLESS-SMUX-REALITY",
-      "listen": "0.0.0.0",
-      "port": 443,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "email": "vless@xtls.reality",
-            "id": "$vision_uuid",
-            "flow": "",
-            "level": 0
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "tcp",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "target": "127.0.0.1:7443",
-          "xver": 0,
-          "serverNames": [
-            "$DOMAIN"
-          ],
-          "privateKey": "$private_key",
-          "shortIds": [
-            "$short_id_1",
-            "$short_id_2",
-            "$short_id_3"
-          ]
-        }
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": [
-          "http",
-          "tls",
-          "quic"
-        ]
-      }
-    }
+$(build_vless_inbound)
   ],
   "outbounds": [
     {
