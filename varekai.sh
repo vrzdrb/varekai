@@ -418,6 +418,8 @@ install_xray() {
         tls_cert_default="/etc/letsencrypt/live/${TLS_SERVER_NAME}"
         read -p "Путь к директории сертификатов [${tls_cert_default}]: " tls_cert_dir
         TLS_CERT_DIR="${tls_cert_dir:-$tls_cert_default}"
+        TLS_CERT_DIR="${TLS_CERT_DIR%/}"
+
 
         echo -e "${CYAN}Xray будет слушать: ${GREEN}${INBOUND_LISTEN}:${INBOUND_PORT}${NC}"
         echo -e "${CYAN}Fallback dest:     ${GREEN}${FALLBACK_PORT}${NC}"
