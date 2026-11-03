@@ -2823,6 +2823,68 @@ server_stats() {
     fi
 }
 
+# --- Выбор пользователей для выдачи параметров ---
+# Заполняет глобальную переменную SELECTED_EMAILS (пусто = все пользователи).
+# Возвращает 1, если выбор отменён или введены несуществующие email'ы.
+prompt_user_selection() {
+    SELECTED_EMAILS=""
+
+    local all_emails
+    all_emails=$(jq -r '[.inbounds[]? | select(.protocol == "vless") | .settings.clients[]? | .email // empty] | unique | .[]' "$CONFIG_PATH" 2>/dev/null)
+
+    if [[ -z "$all_emails" ]]; then
+        echo -e "${YELLOW}Пользователи не найдены в конфиге${NC}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Доступные пользователи:${NC}"
+    local i=1
+    while IFS= read -r email; do
+        echo -e "${CYAN}  $i. $email${NC}"
+        ((i++))
+    done <<< "$all_emails"
+    echo
+
+    read -p "Введите email'ы через запятую или 'all' для всех [all]: " selection
+    selection=${selection:-all}
+
+    if [[ "${selection,,}" == "all" ]]; then
+        return 0
+    fi
+
+    # Нормализация: разделение по запятой, обрезка пробелов, удаление пустых
+    local normalized
+    normalized=$(echo "$selection" | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$')
+
+    if [[ -z "$normalized" ]]; then
+        echo -e "${RED}Список email'ов пуст${NC}"
+        return 1
+    fi
+
+    # Валидация введённых email'ов
+    local invalid=()
+    while IFS= read -r email; do
+        if ! grep -qxF "$email" <<< "$all_emails"; then
+            invalid+=("$email")
+        fi
+    done <<< "$normalized"
+
+    if [[ ${#invalid[@]} -gt 0 ]]; then
+        echo -e "${RED}Следующие email'ы не найдены: ${invalid[*]}${NC}"
+        return 1
+    fi
+
+    SELECTED_EMAILS="$normalized"
+    return 0
+}
+
+# --- Проверка, попадает ли клиент в выборку ---
+user_selected() {
+    local email="$1"
+    [[ -z "$SELECTED_EMAILS" ]] && return 0
+    grep -qxF "$email" <<< "$SELECTED_EMAILS"
+}
+
 # --- Генерация VLESS-ссылок ---
 generate_vless_links() {
     echo -e "${CYAN}=== Генерация VLESS-ссылок ===${NC}"
@@ -2835,6 +2897,11 @@ generate_vless_links() {
     read -p "Введите IP или домен сервера: " server_address
     if [[ -z "$server_address" ]]; then
         echo -e "${RED}Адрес сервера не указан${NC}"
+        return 1
+    fi
+
+    if ! prompt_user_selection; then
+        echo -e "${RED}Генерация отменена${NC}"
         return 1
     fi
 
@@ -2881,6 +2948,8 @@ generate_vless_links() {
             local uuid=$(echo "$client" | jq -r '.id')
             local email=$(echo "$client" | jq -r '.email // "unnamed"')
             local flow=$(echo "$client" | jq -r '.flow // ""')
+
+            user_selected "$email" || continue
 
             local vless_link=""
 
@@ -2937,6 +3006,11 @@ generate_mihomo_proxies() {
     fi
 
     local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    if ! prompt_user_selection; then
+        echo -e "${RED}Генерация отменена${NC}"
+        return 1
+    fi
+
     local proxy_file="${BACKUP_DIR}/mihomo-proxies-${timestamp}.yaml"
     local total_proxies=0
 
@@ -2973,6 +3047,8 @@ generate_mihomo_proxies() {
             local uuid=$(echo "$client" | jq -r '.id')
             local email=$(echo "$client" | jq -r '.email // "unnamed"')
             local flow=$(echo "$client" | jq -r '.flow // ""')
+
+            user_selected "$email" || continue
 
             # Уникальное имя прокси
             local proxy_name="${email} | ${server_address}:${port}"
