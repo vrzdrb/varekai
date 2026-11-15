@@ -433,6 +433,21 @@ install_xray() {
     fi
 
     generate_config
+
+    # Показываем public-key REALITY с паузой, чтобы пользователь успел его записать
+    if [[ "$INBOUND_TYPE" == "reality" ]]; then
+        local install_public_key
+        install_public_key=$(get_reality_public_key)
+        if [[ -n "$install_public_key" ]]; then
+            echo
+            echo -e "${GREEN}═══════════════════════════════════${NC}"
+            echo -e "${GREEN}REALITY Public key: ${install_public_key}${NC}"
+            echo -e "${GREEN}═══════════════════════════════════${NC}"
+            read -r -p "Запишите public-key и нажмите Enter для продолжения..."
+            echo
+        fi
+    fi
+
     create_systemd_service
 
     systemctl daemon-reload
@@ -2823,6 +2838,60 @@ server_stats() {
     fi
 }
 
+# --- Автоопределение внешнего IP сервера ---
+get_server_ip() {
+    local ip=""
+    ip=$(curl -4sf --max-time 5 https://api.ipify.org 2>/dev/null) || \
+    ip=$(curl -4sf --max-time 5 https://ifconfig.me 2>/dev/null) || \
+    ip=$(curl -4sf --max-time 5 https://ipv4.icanhazip.com 2>/dev/null) || \
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    echo "$ip"
+}
+
+# --- Запрос servername (SNI) у пользователя ---
+# Заполняет глобальную SERVER_NAME; возвращает 1 при пустом вводе
+prompt_servername() {
+    SERVER_NAME=""
+    read -p "Введите servername (SNI): " servername_input
+    servername_input=$(echo "$servername_input" | tr -d '[:space:]')
+    if [[ -z "$servername_input" ]]; then
+        echo -e "${RED}Servername не указан${NC}"
+        return 1
+    fi
+    SERVER_NAME="$servername_input"
+}
+
+# --- Получение REALITY public key из private key конфига ---
+# Public key в конфиге не хранится, только privateKey; выводится через xray x25519 -i
+get_reality_public_key() {
+    local private_key
+    private_key=$(jq -r '[.inbounds[]? | select(.protocol == "vless") | .streamSettings.realitySettings.privateKey // empty] | .[0] // empty' "$CONFIG_PATH" 2>/dev/null)
+
+    if [[ -z "$private_key" || ! -x "$XRAY_BIN" ]]; then
+        return 1
+    fi
+
+    "$XRAY_BIN" x25519 -i "$private_key" 2>/dev/null | sed -n '2s/.*:\s*//p'
+}
+
+# --- Просмотр public-key REALITY ---
+show_reality_public_key() {
+    echo -e "${CYAN}=== Public-key REALITY ===${NC}"
+
+    if [[ ! -f "$CONFIG_PATH" ]]; then
+        echo -e "${RED}Конфиг не найден${NC}"
+        return 1
+    fi
+
+    local public_key
+    if ! public_key=$(get_reality_public_key); then
+        echo -e "${RED}REALITY inbound не найден в конфиге${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}${public_key}${NC}"
+}
+
 # --- Выбор пользователей для выдачи параметров ---
 # Заполняет глобальную переменную SELECTED_EMAILS (пусто = все пользователи).
 # Возвращает 1, если выбор отменён или введены несуществующие email'ы.
@@ -2894,9 +2963,14 @@ generate_vless_links() {
         return 1
     fi
 
-    read -p "Введите IP или домен сервера: " server_address
+    local server_address
+    server_address=$(get_server_ip)
     if [[ -z "$server_address" ]]; then
-        echo -e "${RED}Адрес сервера не указан${NC}"
+        echo -e "${RED}Не удалось определить IP сервера${NC}"
+        return 1
+    fi
+
+    if ! prompt_servername; then
         return 1
     fi
 
@@ -2927,10 +3001,14 @@ generate_vless_links() {
         local network=$(echo "$inbound" | jq -r '.streamSettings.network // "tcp"')
         local security=$(echo "$inbound" | jq -r '.streamSettings.security // "none"')
 
-        local public_key=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.publicKey // empty')
+        local private_key=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.privateKey // empty')
+        local public_key=""
+        if [[ -n "$private_key" && -x "$XRAY_BIN" ]]; then
+            public_key=$("$XRAY_BIN" x25519 -i "$private_key" 2>/dev/null | sed -n '2s/.*:\s*//p')
+        fi
         local short_id=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.shortIds[0] // empty')
-        local server_name=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.serverNames[0] // empty')
-        local sni=$(echo "$inbound" | jq -r '.streamSettings.tlsSettings.serverName // empty')
+        local server_name="$SERVER_NAME"
+        local sni="$SERVER_NAME"
         local fp=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.fingerprint // "chrome"')
 
         if [[ "$security" == "reality" && -n "$public_key" ]]; then
@@ -2999,20 +3077,21 @@ generate_mihomo_proxies() {
         return 1
     fi
 
-    read -p "Введите IP или домен сервера: " server_address
+    local server_address
+    server_address=$(get_server_ip)
     if [[ -z "$server_address" ]]; then
-        echo -e "${RED}Адрес сервера не указан${NC}"
+        echo -e "${RED}Не удалось определить IP сервера${NC}"
         return 1
     fi
 
-    local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    if ! prompt_servername; then
+        return 1
+    fi
+
     if ! prompt_user_selection; then
         echo -e "${RED}Генерация отменена${NC}"
         return 1
     fi
-
-    local proxy_file="${BACKUP_DIR}/mihomo-proxies-${timestamp}.yaml"
-    local total_proxies=0
 
     # Получение всех VLESS-inbounds
     local inbounds_json=$(jq -c '.inbounds[] | select(.protocol == "vless")' "$CONFIG_PATH" 2>/dev/null)
@@ -3022,11 +3101,10 @@ generate_mihomo_proxies() {
         return 0
     fi
 
-    echo
-    echo -e "${YELLOW}Генерация Mihomo proxy...${NC}"
-    echo
+    local total_proxies=0
 
-    echo "proxies:" > "$proxy_file"
+    echo
+    echo -e "${YELLOW}proxies:${NC}"
 
     while IFS= read -r inbound; do
         local tag=$(echo "$inbound" | jq -r '.tag // "unnamed"')
@@ -3034,10 +3112,14 @@ generate_mihomo_proxies() {
         local network=$(echo "$inbound" | jq -r '.streamSettings.network // "tcp"')
         local security=$(echo "$inbound" | jq -r '.streamSettings.security // "none"')
 
-        local public_key=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.publicKey // empty')
+        local private_key=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.privateKey // empty')
+        local public_key=""
+        if [[ -n "$private_key" && -x "$XRAY_BIN" ]]; then
+            public_key=$("$XRAY_BIN" x25519 -i "$private_key" 2>/dev/null | sed -n '2s/.*:\s*//p')
+        fi
         local short_id=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.shortIds[0] // empty')
-        local server_name=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.serverNames[0] // empty')
-        local sni=$(echo "$inbound" | jq -r '.streamSettings.tlsSettings.serverName // empty')
+        local server_name="$SERVER_NAME"
+        local sni="$SERVER_NAME"
         local fp=$(echo "$inbound" | jq -r '.streamSettings.realitySettings.fingerprint // "chrome"')
 
         local clients=$(echo "$inbound" | jq -c '.settings.clients[]?' 2>/dev/null)
@@ -3053,40 +3135,32 @@ generate_mihomo_proxies() {
             # Уникальное имя прокси
             local proxy_name="${email} | ${server_address}:${port}"
 
-            {
-                echo "  - name: \"${proxy_name}\""
-                echo "    type: vless"
-                echo "    server: ${server_address}"
-                echo "    port: ${port}"
-                echo "    uuid: ${uuid}"
-                echo "    network: ${network}"
-            } >> "$proxy_file"
+            echo -e "  - ${YELLOW}name: \"${proxy_name}\"${NC}"
+            echo -e "    ${CYAN}type: vless${NC}"
+            echo -e "    ${CYAN}server: ${server_address}${NC}"
+            echo -e "    ${CYAN}port: ${port}${NC}"
+            echo -e "    ${CYAN}uuid: ${uuid}${NC}"
+            echo -e "    ${CYAN}network: ${network}${NC}"
 
-            if [[ "$security" == "reality" ]]; then
-                {
-                    echo "    tls: true"
-                    echo "    servername: ${server_name}"
-                    echo "    reality-opts:"
-                    echo "      public-key: ${public_key}"
-                    echo "      short-id: ${short_id}"
-                } >> "$proxy_file"
+            if [[ "$security" == "reality" && -n "$public_key" ]]; then
+                echo -e "    ${CYAN}tls: true${NC}"
+                echo -e "    ${CYAN}servername: ${server_name}${NC}"
+                echo -e "    ${CYAN}reality-opts:${NC}"
+                echo -e "      ${CYAN}public-key: ${public_key}${NC}"
+                echo -e "      ${CYAN}short-id: ${short_id}${NC}"
             elif [[ "$security" == "tls" ]]; then
-                {
-                    echo "    tls: true"
-                    echo "    servername: ${sni}"
-                } >> "$proxy_file"
+                echo -e "    ${CYAN}tls: true${NC}"
+                echo -e "    ${CYAN}servername: ${sni}${NC}"
             fi
 
-            {
-                echo "    client-fingerprint: ${fp}"
-                echo "    udp: true"
-            } >> "$proxy_file"
+            echo -e "    ${CYAN}client-fingerprint: ${fp}${NC}"
+            echo -e "    ${CYAN}udp: true${NC}"
 
             if [[ -n "$flow" ]]; then
-                echo "    flow: ${flow}" >> "$proxy_file"
+                echo -e "    ${CYAN}flow: ${flow}${NC}"
             fi
 
-            echo >> "$proxy_file"
+            echo
 
             ((proxy_count++))
             ((total_proxies++))
@@ -3095,20 +3169,10 @@ generate_mihomo_proxies() {
         echo -e "${YELLOW}Сгенерировано proxy для ${tag}: ${proxy_count}${NC}"
     done <<< "$inbounds_json"
 
-    echo
     echo -e "${GREEN}═══════════════════════════════════${NC}"
     echo -e "${GREEN}✓ Итого сгенерировано proxy: ${total_proxies}${NC}"
-    echo -e "${YELLOW}Файл сохранён в: ${proxy_file}${NC}"
     echo
-    echo -e "${CYAN}Добавьте этот файл в ваш Mihomo конфиг через proxy-providers:${NC}"
-    echo -e "${YELLOW}proxy-providers:${NC}"
-    echo -e "${YELLOW}  my-proxies:${NC}"
-    echo -e "${YELLOW}    type: file${NC}"
-    echo -e "${YELLOW}    path: ./mihomo-proxies.yaml${NC}"
-    echo -e "${YELLOW}    health-check:${NC}"
-    echo -e "${YELLOW}      enable: true${NC}"
-    echo -e "${YELLOW}      url: https://www.gstatic.com/generate_204${NC}"
-    echo -e "${YELLOW}      interval: 300${NC}"
+    echo -e "${CYAN}Скопируйте блок proxies: в раздел proxies вашего Mihomo конфига.${NC}"
 }
 
 # =============================================================================
@@ -3313,6 +3377,7 @@ show_menu() {
     echo -e "${BRIGHT_RED}13. ${CYAN}Просмотр статистики сервера${NC}"
     echo -e "${BRIGHT_RED}14. ${CYAN}Выдать ключ vless://${NC}"
     echo -e "${BRIGHT_RED}15. ${CYAN}Выдать Mihomo proxy${NC}"
+    echo -e "${BRIGHT_RED}21. ${CYAN}Посмотреть public-key REALITY${NC}"
     echo -e "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-"
     echo -e "${BRIGHT_RED}16. ${CYAN}Ротация логов${NC}"
     echo -e "${BRIGHT_RED}17. ${CYAN}Просмотр access.log${NC}"
@@ -3342,7 +3407,7 @@ main() {
     while true; do
         show_menu
 
-        read -p "Выберите пункт меню [0-20]: " choice
+        read -p "Выберите пункт меню [0-21]: " choice
 
         case $choice in
             1) install_xray ;;
@@ -3360,6 +3425,7 @@ main() {
             13) server_stats ;;
             14) generate_vless_links ;;
             15) generate_mihomo_proxies ;;
+            21) show_reality_public_key ;;
             16) log_rotation_menu ;;
             17) view_access_log ;;
             18) search_access_log ;;
