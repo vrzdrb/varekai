@@ -3377,7 +3377,6 @@ show_menu() {
     echo -e "${BRIGHT_RED}13. ${CYAN}Просмотр статистики сервера${NC}"
     echo -e "${BRIGHT_RED}14. ${CYAN}Выдать ключ vless://${NC}"
     echo -e "${BRIGHT_RED}15. ${CYAN}Выдать Mihomo proxy${NC}"
-    echo -e "${BRIGHT_RED}21. ${CYAN}Посмотреть public-key REALITY${NC}"
     echo -e "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-"
     echo -e "${BRIGHT_RED}16. ${CYAN}Ротация логов${NC}"
     echo -e "${BRIGHT_RED}17. ${CYAN}Просмотр access.log${NC}"
@@ -3385,6 +3384,7 @@ show_menu() {
     echo -e "${BRIGHT_RED}19. ${CYAN}Просмотр error.log${NC}"
     echo -e "-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-"
     echo -e "${BRIGHT_RED}20. ${CYAN}Быстрый перезапуск Xray${NC}"
+    echo -e "${BRIGHT_RED}21. ${CYAN}Посмотреть public-key REALITY${NC}"
     echo -e "${BRIGHT_RED}0. ${CYAN}Выход${NC}"
     echo
 }
